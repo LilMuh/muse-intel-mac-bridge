@@ -100,6 +100,8 @@ python3 mab.py type "你好 hello"             # 输入文字
 python3 mab.py key command space            # 组合键
 python3 mab.py scroll -5 640 400            # 在 (640,400) 处向下滚动
 python3 mab.py drag 100 100 300 300         # 拖拽
+python3 mab.py wechat-read "联系人" -n 10 -a work           # 读微信聊天记录（见下文）
+python3 mab.py wechat-send "联系人" "内容" -a work          # 发微信；加 --dry-run 只粘贴不发送
 ```
 
 ## 让 Muse 收发微信（可选）
@@ -169,19 +171,20 @@ python3 mab.py wechat-send "张三" "明天下午三点开会" -a work
 | `ok` | 已发出，并且在聊天记录里确认过 | — |
 | `not_found` | 搜索结果里没有这个名字 | 名字要和微信里显示的**完全一致**（有备注就用备注名） |
 | `duplicate_name` | 有多个同名联系人或群 | 在微信里给对方设置一个唯一的备注名 |
-| `draft_in_input` | 输入框里已有草稿 | 到 Mac 上清空输入框再重试 |
+| `draft_in_input` | 输入框里已有草稿。直接粘贴的话，草稿会和消息一起发出去，所以先停下 | 到 Mac 上清空输入框再重试 |
 | `unconfirmed_do_not_retry` | 可能已经发出，但没能确认 | **不要重发**，先用 `wechat-read` 看一下 |
-| `verify_failed` | 点击搜索结果后聊天没切换过去 | 不会粘贴也不会发送，重试即可 |
-| `send_failed` | 发送失败 | 检查微信窗口状态后重试 |
-| `daily_limit` | 触发发送频率限制（每天最多 300 条） | 稍后再试，或换账号 |
+| `verify_failed` | 某项核对没通过：聊天没切换过去、输入框不属于这个联系人、粘贴后内容对不上等。没有发送 | 消息可能还留在输入框里，清空后再重试 |
+| `send_failed` | 发送失败：消息旁边出现了红色感叹号，通常是网络问题 | 检查网络后重试 |
+| `daily_limit` | 这个账号今天已经发满 500 条 | 明天再发，或调高 `WX_DAILY_MAX` |
 | `focus_lost` | 发送过程中微信被切走了 | 发送期间别动 Mac，然后重试 |
 | `environment` | 屏幕锁定、微信没开、权限不够等 | 看 `output` 里的提示 |
+| `bad_request` | 参数不对、账号没配置，或开着多个微信却没指定 `-a` | 看 `output` 里的提示 |
 
 ### 限制
 
 - `wechat-read` 只能读到聊天窗口里当前加载出来的消息（通常是最近十几条），也分不出每条是谁发的。
 - 同一时间只处理一个请求，其余的排队等待（最多 180 秒）。
-- 内置防风控：同一账号两次发送至少间隔 3 秒，每天最多 300 条。
+- 内置防风控：同一账号两次发送至少间隔 3 秒（间隔不够会自动等待），每天最多 500 条（`WX_DAILY_MAX` 可调）。
 - 偶尔会出现点击搜索结果后聊天没有切换过去的情况，这时会返回 `verify_failed`，不会粘贴也不会发送，重试即可。
 
 ## HTTP API

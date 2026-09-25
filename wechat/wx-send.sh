@@ -25,7 +25,7 @@
 #   WX_TIMEOUT=5        等搜索结果 / 等聊天打开的最长秒数
 #   WX_MIN_INTERVAL=3   同一账号两次发送的最小间隔（秒）
 #   WX_JITTER=2         额外随机等待 0~N 秒
-#   WX_DAILY_MAX=300    每个账号每天最多发送条数
+#   WX_DAILY_MAX=500    每个账号每天最多发送条数
 #   WX_NO_CONFIRM=1     发送后不做确认（快约 0.3 秒）
 #   WX_TITLE_MINX=270   聊天区域左边界（相对窗口，单位：点）
 #   WX_LIST_W=420       搜索下拉框识别宽度
@@ -149,7 +149,7 @@ let DRY_RUN = env["WX_DRY_RUN"] == "1"
 let TIMEOUT = envD("WX_TIMEOUT", 5)
 let MIN_INTERVAL = envD("WX_MIN_INTERVAL", 3)
 let JITTER = max(0, envD("WX_JITTER", 2))
-let DAILY_MAX = Int(envD("WX_DAILY_MAX", 300))
+let DAILY_MAX = Int(envD("WX_DAILY_MAX", 500))
 let CONFIRM = env["WX_NO_CONFIRM"] != "1"
 let TITLE_MINX = CGFloat(envD("WX_TITLE_MINX", 270))
 let TITLE_H = CGFloat(envD("WX_TITLE_H", 80))
