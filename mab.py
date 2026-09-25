@@ -15,8 +15,8 @@ muse-intel-mac-bridge · 客户端（在 agent 的 Linux VM 里运行，只依�
   python3 mab.py scroll AMOUNT [X Y]        # 正数向上，负数向下
   python3 mab.py type "要输入的文字"
   python3 mab.py key command c              # 组合键，例如 command+c
-  python3 mab.py wechat-read "联系人" [-n 20] [-a myname]
-  python3 mab.py wechat-send "联系人" "消息" [--dry-run] [-a myname]
+  python3 mab.py wechat-read "联系人" [-n 20] [-a work]
+  python3 mab.py wechat-send "联系人" "消息" [--dry-run] [-a work]
 
 坐标 = 最近一次 screenshot 图片上的像素坐标。
 """

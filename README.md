@@ -108,11 +108,18 @@ Muse 可以按联系人名字直接发微信、读聊天记录，不需要截图
 
 ### Mac 端准备（只需一次）
 
-1. 把 `wx-send.sh` 放到 `~/Downloads/wx-send/wx-send.sh`。放在别处的话，在 `.env` 里加一行 `WX_SEND=/你的路径/wx-send.sh`。
-2. 打开 `wx-send.sh`，在顶部的账号表里填好你的微信 App 路径和别名（例如 `/Applications/WeChat.app` → `myname`）。只开一个微信时可以不填，调用时省略 `-a`。
+1. 脚本已经在仓库里：`wechat/wx-send.sh`，不需要另外下载。首次运行会自动编译一次，需要先装好 Xcode 命令行工具：`xcode-select --install`。
+2. 在 `.env` 里配置微信账号（`.env` 不会被提交到 Git）。格式是 `别名=App 路径`，多个账号用逗号分隔：
+   ```bash
+   # 一个微信
+   WX_ACCOUNTS=me=/Applications/WeChat.app
+   # 两个微信（第二个是复制出来的 App）
+   WX_ACCOUNTS=work=/Applications/WeChat.app,home=/Applications/WeChat2.app
+   ```
+   只开一个微信时，也可以不配置，调用时省略 `-a`。别名里不能有逗号和等号。
 3. 在 Mac 终端里试运行一次（只粘贴、不发送）：
    ```bash
-   WX_DRY_RUN=1 ~/Downloads/wx-send/wx-send.sh -a myname "文件传输助手" "测试"
+   WX_DRY_RUN=1 ./wechat/wx-send.sh -a work "文件传输助手" "测试"
    ```
    看到「🧪 试运行：已粘贴到「文件传输助手」的输入框」就说明正常。然后到微信里把输入框清空。
 4. 重启 bridge：`./start.sh --funnel`。
@@ -128,11 +135,11 @@ Muse 可以按联系人名字直接发微信、读聊天记录，不需要截图
 
 **第 2 步：读一条试试。** 对 Muse 说：
 
-> 用 mab.py 读一下微信「文件传输助手」最近 5 条消息，账号是 myname。
+> 用 mab.py 读一下微信「文件传输助手」最近 5 条消息，账号是 work。
 
 它会运行：
 ```bash
-python3 mab.py wechat-read "文件传输助手" -n 5 -a myname
+python3 mab.py wechat-read "文件传输助手" -n 5 -a work
 ```
 返回的 `items` 里就是聊天记录。
 
@@ -142,7 +149,7 @@ python3 mab.py wechat-read "文件传输助手" -n 5 -a myname
 
 它会运行：
 ```bash
-python3 mab.py wechat-send "文件传输助手" "你好" --dry-run -a myname
+python3 mab.py wechat-send "文件传输助手" "你好" --dry-run -a work
 ```
 到 Mac 上看，输入框里应该有「你好」但没有发出去。确认后把输入框清空。
 
@@ -152,7 +159,7 @@ python3 mab.py wechat-send "文件传输助手" "你好" --dry-run -a myname
 
 Muse 应该先复述联系人和内容，等你回复「确认」后再运行：
 ```bash
-python3 mab.py wechat-send "张三" "明天下午三点开会" -a myname
+python3 mab.py wechat-send "张三" "明天下午三点开会" -a work
 ```
 
 **第 5 步：看结果。** 返回的 `status` 表示结果：
@@ -172,6 +179,7 @@ python3 mab.py wechat-send "张三" "明天下午三点开会" -a myname
 - `wechat-read` 只能读到聊天窗口里当前加载出来的消息（通常是最近十几条），也分不出每条是谁发的。
 - 同一时间只处理一个请求，其余的排队等待（最多 180 秒）。
 - 内置防风控：同一账号两次发送至少间隔 3 秒，每天最多 300 条。
+- 偶尔会出现点击搜索结果后聊天没有切换过去的情况，这时会返回 `verify_failed`，不会粘贴也不会发送，重试即可。
 
 ## HTTP API
 
@@ -203,7 +211,8 @@ python3 mab.py wechat-send "张三" "明天下午三点开会" -a myname
 | `PORT` | `8765` | 端口 |
 | `TARGET_W` | `1280` | 截图宽度 |
 | `JPEG_QUALITY` | `60` | JPEG 质量，1–100 |
-| `WX_SEND` | `~/Downloads/wx-send/wx-send.sh` | 微信接口使用的脚本路径 |
+| `WX_ACCOUNTS` | 空 | 微信账号，`别名=App 路径`，多个用逗号分隔 |
+| `WX_SEND` | `wechat/wx-send.sh` | 微信接口使用的脚本路径 |
 
 ## 安全须知
 

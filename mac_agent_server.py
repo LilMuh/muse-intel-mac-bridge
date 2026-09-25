@@ -14,8 +14,8 @@ muse-intel-mac-bridge · Mac 端服务
   POST /scroll        {"amount":-5,"x":640,"y":400}   正数向上；x/y 可选
   POST /type          {"text":"hello 你好"}            非 ASCII 自动走剪贴板粘贴
   POST /key           {"keys":["command","c"]}
-  POST /wechat/send   {"to":"联系人","text":"消息","account":"myname","dry_run":false}
-  POST /wechat/read   {"chat":"联系人","limit":20,"account":"myname"}
+  POST /wechat/send   {"to":"联系人","text":"消息","account":"work","dry_run":false}
+  POST /wechat/read   {"chat":"联系人","limit":20,"account":"work"}
                       微信接口调用 wx-send.sh，按名字精确匹配，不需要截图和坐标
 
 所有坐标都是「最近一次截图上的像素坐标」，服务自动换算成 macOS 逻辑坐标，
@@ -27,7 +27,8 @@ Retina 缩放与截图缩放比例 agent 都无需关心。
   PORT          默认 8765
   TARGET_W      截图宽度，默认 1280
   JPEG_QUALITY  默认 60
-  WX_SEND       wx-send.sh 的路径，默认 ~/Downloads/wx-send/wx-send.sh
+  WX_SEND       wx-send.sh 的路径，默认用仓库里的 wechat/wx-send.sh
+  WX_ACCOUNTS   微信账号：别名=App 路径，多个用逗号分隔（只开一个微信可不填）
 """
 import hmac
 import json
@@ -51,7 +52,8 @@ HOST = os.environ.get("HOST", "127.0.0.1")
 PORT = int(os.environ.get("PORT", "8765"))
 TARGET_W = int(os.environ.get("TARGET_W", "1280"))
 QUALITY = os.environ.get("JPEG_QUALITY", "60")
-WX_SEND = os.path.expanduser(os.environ.get("WX_SEND", "~/Downloads/wx-send/wx-send.sh"))
+WX_SEND = os.path.expanduser(os.environ.get(
+    "WX_SEND", os.path.join(os.path.dirname(os.path.abspath(__file__)), "wechat", "wx-send.sh")))
 
 pyautogui.FAILSAFE = True  # 把鼠标甩到屏幕左上角可紧急中断 agent 的操作
 pyautogui.PAUSE = 0.05
