@@ -14,6 +14,9 @@ muse-intel-mac-bridge · Mac 端服务
   POST /scroll        {"amount":-5,"x":640,"y":400}   正数向上；x/y 可选
   POST /type          {"text":"hello 你好"}            非 ASCII 自动走剪贴板粘贴
   POST /key           {"keys":["command","c"]}
+  POST /wechat/send   {"to":"联系人","text":"消息","account":"myname","dry_run":false}
+  POST /wechat/read   {"chat":"联系人","limit":20,"account":"myname"}
+                      微信接口调用 wx-send.sh，按名字精确匹配，不需要截图和坐标
 
 所有坐标都是「最近一次截图上的像素坐标」，服务自动换算成 macOS 逻辑坐标，
 Retina 缩放与截图缩放比例 agent 都无需关心。
@@ -24,6 +27,7 @@ Retina 缩放与截图缩放比例 agent 都无需关心。
   PORT          默认 8765
   TARGET_W      截图宽度，默认 1280
   JPEG_QUALITY  默认 60
+  WX_SEND       wx-send.sh 的路径，默认 ~/Downloads/wx-send/wx-send.sh
 """
 import hmac
 import json
@@ -35,7 +39,7 @@ import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"
 
 if sys.platform != "darwin":
     raise SystemExit("mac_agent_server.py 只能在 macOS 上运行 / This server only runs on macOS.")
@@ -47,6 +51,7 @@ HOST = os.environ.get("HOST", "127.0.0.1")
 PORT = int(os.environ.get("PORT", "8765"))
 TARGET_W = int(os.environ.get("TARGET_W", "1280"))
 QUALITY = os.environ.get("JPEG_QUALITY", "60")
+WX_SEND = os.path.expanduser(os.environ.get("WX_SEND", "~/Downloads/wx-send/wx-send.sh"))
 
 pyautogui.FAILSAFE = True  # 把鼠标甩到屏幕左上角可紧急中断 agent 的操作
 pyautogui.PAUSE = 0.05
@@ -136,9 +141,54 @@ def a_key(p):
     pyautogui.hotkey(*keys)
 
 
+# wx-send.sh 的退出码
+WX_STATUS = {
+    0: "ok", 2: "not_found", 3: "duplicate_name", 4: "verify_failed", 5: "environment",
+    6: "focus_lost", 7: "draft_in_input", 8: "send_failed", 9: "daily_limit",
+    10: "unconfirmed_do_not_retry", 64: "bad_request",
+}
+
+
+def run_wx(args, account=None, env=None):
+    if not os.path.isfile(WX_SEND):
+        raise ValueError(f"找不到 wx-send.sh：{WX_SEND}（用环境变量 WX_SEND 指定）")
+    cmd = [WX_SEND] + (["-a", account] if account else []) + args
+    # 排队等锁最多 180 秒，首次运行还要编译
+    r = subprocess.run(cmd, capture_output=True, text=True, timeout=300, env=dict(os.environ, **(env or {})))
+    return r.returncode, r.stdout.strip(), r.stderr.strip()
+
+
+def text_arg(p, k):
+    v = p.get(k)
+    if not isinstance(v, str) or not v.strip():
+        raise ValueError(f"缺少 {k}")
+    return v
+
+
+def a_wechat_send(p):
+    to, text = text_arg(p, "to"), text_arg(p, "text")
+    env = {"WX_DRY_RUN": "1"} if p.get("dry_run") else {}
+    code, out, err = run_wx([to, text], p.get("account"), env)
+    return {"ok": code == 0, "code": code, "status": WX_STATUS.get(code, "error"),
+            "dry_run": bool(p.get("dry_run")), "output": "\n".join(x for x in (out, err) if x)}
+
+
+def a_wechat_read(p):
+    chat = text_arg(p, "chat")
+    limit = int(p.get("limit", 20))
+    if not 1 <= limit <= 200:
+        raise ValueError("limit 需在 1–200 之间")
+    code, out, err = run_wx(["--read", chat, str(limit)], p.get("account"))
+    if code != 0:
+        return {"ok": False, "code": code, "status": WX_STATUS.get(code, "error"), "output": err or out}
+    data = json.loads(out[out.index("{"):])
+    return {"ok": True, "code": 0, "status": "ok", **data}
+
+
 ACTIONS = {
     "click": a_click, "move": a_move, "drag": a_drag,
     "scroll": a_scroll, "type": a_type, "key": a_key,
+    "wechat/send": a_wechat_send, "wechat/read": a_wechat_read,
 }
 
 
@@ -193,8 +243,8 @@ class Handler(BaseHTTPRequestHandler):
             length = int(self.headers.get("Content-Length", 0))
             payload = json.loads(self.rfile.read(length) or b"{}")
             with lock:
-                action(payload)
-            return self._send(200, {"ok": True})
+                result = action(payload)
+            return self._send(200, result or {"ok": True})
         except pyautogui.FailSafeException:
             return self._send(409, {"error": "failsafe triggered: mouse is in a screen corner"})
         except Exception as e:

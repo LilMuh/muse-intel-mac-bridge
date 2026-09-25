@@ -102,6 +102,77 @@ python3 mab.py scroll -5 640 400            # 在 (640,400) 处向下滚动
 python3 mab.py drag 100 100 300 300         # 拖拽
 ```
 
+## 让 Muse 收发微信（可选）
+
+Muse 可以按联系人名字直接发微信、读聊天记录，不需要截图找坐标。Mac 端调用 `wx-send.sh` 完成操作：联系人按名字**完全一致**匹配，聊天标题、输入框、发送结果都逐字核对，任何一步对不上就停止，不会发错人。
+
+### Mac 端准备（只需一次）
+
+1. 把 `wx-send.sh` 放到 `~/Downloads/wx-send/wx-send.sh`。放在别处的话，在 `.env` 里加一行 `WX_SEND=/你的路径/wx-send.sh`。
+2. 打开 `wx-send.sh`，在顶部的账号表里填好你的微信 App 路径和别名（例如 `/Applications/WeChat.app` → `myname`）。只开一个微信时可以不填，调用时省略 `-a`。
+3. 在 Mac 终端里试运行一次（只粘贴、不发送）：
+   ```bash
+   WX_DRY_RUN=1 ~/Downloads/wx-send/wx-send.sh -a myname "文件传输助手" "测试"
+   ```
+   看到「🧪 试运行：已粘贴到「文件传输助手」的输入框」就说明正常。然后到微信里把输入框清空。
+4. 重启 bridge：`./start.sh --funnel`。
+5. 使用期间：微信保持登录、主窗口开着，屏幕不要锁定。发消息时微信会被切到前台，大约 1–3 秒，这时不要动鼠标和键盘。
+
+### 教 Muse 使用（一步一步）
+
+**第 1 步：连通。** 先按上面的「连接 Muse」把 [docs/muse-prompt.md](docs/muse-prompt.md) 发给 Muse。然后对它说：
+
+> 运行 `python3 mab.py info`，看看 actions 里有没有 wechat/send。
+
+有的话就说明微信功能可以用了。
+
+**第 2 步：读一条试试。** 对 Muse 说：
+
+> 用 mab.py 读一下微信「文件传输助手」最近 5 条消息，账号是 myname。
+
+它会运行：
+```bash
+python3 mab.py wechat-read "文件传输助手" -n 5 -a myname
+```
+返回的 `items` 里就是聊天记录。
+
+**第 3 步：试运行发送。** 对 Muse 说：
+
+> 给微信「文件传输助手」试运行发一条「你好」，只粘贴不发送。
+
+它会运行：
+```bash
+python3 mab.py wechat-send "文件传输助手" "你好" --dry-run -a myname
+```
+到 Mac 上看，输入框里应该有「你好」但没有发出去。确认后把输入框清空。
+
+**第 4 步：正式发送。** 对 Muse 说：
+
+> 给微信「张三」发：明天下午三点开会。
+
+Muse 应该先复述联系人和内容，等你回复「确认」后再运行：
+```bash
+python3 mab.py wechat-send "张三" "明天下午三点开会" -a myname
+```
+
+**第 5 步：看结果。** 返回的 `status` 表示结果：
+
+| status | 意思 | 怎么办 |
+|---|---|---|
+| `ok` | 已发出，并且在聊天记录里确认过 | — |
+| `not_found` | 搜索结果里没有这个名字 | 名字要和微信里显示的**完全一致**（有备注就用备注名） |
+| `duplicate_name` | 有多个同名联系人或群 | 在微信里给对方设置一个唯一的备注名 |
+| `draft_in_input` | 输入框里已有草稿 | 到 Mac 上清空输入框再重试 |
+| `unconfirmed_do_not_retry` | 可能已经发出，但没能确认 | **不要重发**，先用 `wechat-read` 看一下 |
+| `focus_lost` | 发送过程中微信被切走了 | 发送期间别动 Mac，然后重试 |
+| `environment` | 屏幕锁定、微信没开、权限不够等 | 看 `output` 里的提示 |
+
+### 限制
+
+- `wechat-read` 只能读到聊天窗口里当前加载出来的消息（通常是最近十几条），也分不出每条是谁发的。
+- 同一时间只处理一个请求，其余的排队等待（最多 180 秒）。
+- 内置防风控：同一账号两次发送至少间隔 3 秒，每天最多 300 条。
+
 ## HTTP API
 
 所有请求需要带 `Authorization: Bearer <token>`。
@@ -116,6 +187,8 @@ python3 mab.py drag 100 100 300 300         # 拖拽
 | POST | `/scroll` | `{"amount","x?","y?"}` | 滚动，正数向上 |
 | POST | `/type` | `{"text"}` | 输入文字（支持中文） |
 | POST | `/key` | `{"keys":[...]}` | 按键或组合键 |
+| POST | `/wechat/send` | `{"to","text","account?","dry_run?"}` | 发微信（见上文） |
+| POST | `/wechat/read` | `{"chat","limit?","account?"}` | 读聊天记录，默认 20 条 |
 
 注意：操作前至少要调用一次 `/screenshot`，服务才知道该用哪个坐标系。
 
@@ -130,6 +203,7 @@ python3 mab.py drag 100 100 300 300         # 拖拽
 | `PORT` | `8765` | 端口 |
 | `TARGET_W` | `1280` | 截图宽度 |
 | `JPEG_QUALITY` | `60` | JPEG 质量，1–100 |
+| `WX_SEND` | `~/Downloads/wx-send/wx-send.sh` | 微信接口使用的脚本路径 |
 
 ## 安全须知
 
@@ -174,6 +248,7 @@ The official Muse for Mac app ships as arm64-only, so on Intel Macs it fails wit
 - The agent always works in screenshot pixel coordinates; the server maps them to macOS points (Retina-aware).
 - Binds to `127.0.0.1` by default; every request needs a bearer token.
 - Works on Intel and Apple silicon, macOS 12+.
+- Optional WeChat endpoints (`/wechat/send`, `/wechat/read`) call `wx-send.sh` on the Mac to send/read messages by exact contact name, with no screenshots involved.
 
 Quick start: `./start.sh` → grant Screen Recording + Accessibility to your terminal → `./start.sh --funnel` → paste [docs/muse-prompt.md](docs/muse-prompt.md) into Muse.
 

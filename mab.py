@@ -15,6 +15,8 @@ muse-intel-mac-bridge · 客户端（在 agent 的 Linux VM 里运行，只依�
   python3 mab.py scroll AMOUNT [X Y]        # 正数向上，负数向下
   python3 mab.py type "要输入的文字"
   python3 mab.py key command c              # 组合键，例如 command+c
+  python3 mab.py wechat-read "联系人" [-n 20] [-a myname]
+  python3 mab.py wechat-send "联系人" "消息" [--dry-run] [-a myname]
 
 坐标 = 最近一次 screenshot 图片上的像素坐标。
 """
@@ -30,7 +32,7 @@ TOKEN = os.environ.get("MAB_TOKEN", "")
 TIMEOUT = float(os.environ.get("MAB_TIMEOUT", "30"))
 
 
-def request(method, path, payload=None):
+def request(method, path, payload=None, timeout=TIMEOUT):
     if not URL or not TOKEN:
         sys.exit("请先设置 MAB_URL 和 MAB_TOKEN 环境变量 / set MAB_URL and MAB_TOKEN")
     data = json.dumps(payload).encode() if payload is not None else None
@@ -39,7 +41,7 @@ def request(method, path, payload=None):
     if data is not None:
         req.add_header("Content-Type", "application/json")
     try:
-        with urllib.request.urlopen(req, timeout=TIMEOUT) as r:
+        with urllib.request.urlopen(req, timeout=timeout) as r:
             return r.read(), dict(r.headers)
     except urllib.error.HTTPError as e:
         sys.exit(f"HTTP {e.code}: {e.read().decode(errors='replace')}")
@@ -47,8 +49,8 @@ def request(method, path, payload=None):
         sys.exit(f"连接失败 / connection failed: {e.reason}")
 
 
-def post(path, payload):
-    body, _ = request("POST", path, payload)
+def post(path, payload, timeout=TIMEOUT):
+    body, _ = request("POST", path, payload, timeout)
     print(body.decode())
 
 
@@ -68,6 +70,10 @@ def main():
     sc.add_argument("x", type=int, nargs="?"); sc.add_argument("y", type=int, nargs="?")
     t = sub.add_parser("type"); t.add_argument("text")
     k = sub.add_parser("key"); k.add_argument("keys", nargs="+")
+    wr = sub.add_parser("wechat-read"); wr.add_argument("chat")
+    wr.add_argument("-n", "--limit", type=int, default=20); wr.add_argument("-a", "--account")
+    ws = sub.add_parser("wechat-send"); ws.add_argument("to"); ws.add_argument("text")
+    ws.add_argument("--dry-run", action="store_true"); ws.add_argument("-a", "--account")
 
     a = ap.parse_args()
     if a.cmd == "info":
@@ -94,6 +100,11 @@ def main():
         post("/type", {"text": a.text})
     elif a.cmd == "key":
         post("/key", {"keys": a.keys})
+    elif a.cmd == "wechat-read":
+        # 微信操作要排队（最多 180 秒），超时放宽
+        post("/wechat/read", {"chat": a.chat, "limit": a.limit, "account": a.account}, max(TIMEOUT, 320))
+    elif a.cmd == "wechat-send":
+        post("/wechat/send", {"to": a.to, "text": a.text, "dry_run": a.dry_run, "account": a.account}, max(TIMEOUT, 320))
 
 
 if __name__ == "__main__":
