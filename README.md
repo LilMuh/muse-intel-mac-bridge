@@ -171,6 +171,9 @@ python3 mab.py wechat-send "张三" "明天下午三点开会" -a work
 | `duplicate_name` | 有多个同名联系人或群 | 在微信里给对方设置一个唯一的备注名 |
 | `draft_in_input` | 输入框里已有草稿 | 到 Mac 上清空输入框再重试 |
 | `unconfirmed_do_not_retry` | 可能已经发出，但没能确认 | **不要重发**，先用 `wechat-read` 看一下 |
+| `verify_failed` | 点击搜索结果后聊天没切换过去 | 不会粘贴也不会发送，重试即可 |
+| `send_failed` | 发送失败 | 检查微信窗口状态后重试 |
+| `daily_limit` | 触发发送频率限制（每天最多 300 条） | 稍后再试，或换账号 |
 | `focus_lost` | 发送过程中微信被切走了 | 发送期间别动 Mac，然后重试 |
 | `environment` | 屏幕锁定、微信没开、权限不够等 | 看 `output` 里的提示 |
 
