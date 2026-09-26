@@ -196,7 +196,7 @@ python3 mab.py wechat-send "张三" "明天下午三点开会" -a work
 **它会做什么：**
 1. 从左侧「微信」标签读出未读总数；0 条就直接返回。
 2. 扫描会话列表，找出要读的聊天。
-3. 逐个点开，读新消息。每条消息都会点一下头像，从弹出的资料卡里读出发送人的昵称和微信号（`from` 是 `me` / `other` / `system`）。
+3. 逐个点开，读新消息。**群聊**里每条消息会点一下头像，从弹出的资料卡里读出发送人的昵称和微信号（`from` 是 `me` / `other` / `system`）；**私聊**不点头像，发送人就是这个聊天本身（`group: false`）。
 4. 切回你原来打开的聊天，把读过的聊天**标回未读**（右键 →「标为未读」）。标回后显示「1条未读」，不是原来的条数。
 
 **不会重复读：** 每个聊天会记下读到的最后 3 条消息（存在本机 `~/.cache/wx-send/cursor/`，不会上传）。下次只返回这之后的新消息；会话列表的预览和上次一样的，直接跳过，不点进去。3 天没更新的记录每天自动清理一次。
@@ -210,9 +210,12 @@ python3 mab.py wechat-send "张三" "明天下午三点开会" -a work
 **返回示例：**
 ```json
 {"ok": true, "total": 1, "skipped_no_new": [], "notes": [],
- "chats": [{"name": "张三", "unread": 2, "new": 2, "muted": false, "pinned": false, "time": "15:42",
-            "remarked_unread": true,
-            "messages": [{"type": "message", "text": "明天几点？", "from": "other", "sender": "张三", "wxid": "zhangsan01"}]}]}
+ "chats": [{"name": "张三", "group": false, "unread": 1, "new": 1, "muted": false, "pinned": false,
+            "time": "15:42", "remarked_unread": true,
+            "messages": [{"type": "message", "text": "明天几点？"}]},
+           {"name": "项目群", "group": true, "unread": 1, "new": 1, "muted": false, "pinned": false,
+            "time": "15:40", "remarked_unread": true,
+            "messages": [{"type": "message", "text": "方案发群里了", "from": "other", "sender": "李四", "wxid": "lisi_88"}]}]}
 ```
 
 **管理读取记录：**
@@ -222,7 +225,7 @@ python3 mab.py wechat-prune --days 3 -a work    # 删掉 3 天没更新的读取
 ```
 
 **注意：**
-- 执行期间微信会被切到前台，逐个点开聊天、点头像。未读多的时候可能要几分钟，期间不要动 Mac。
+- 执行期间微信会被切到前台，逐个点开聊天，群聊还要逐条点头像。未读多的时候可能要几分钟，期间不要动 Mac。
 - 每次最多读 20 个聊天、每个聊天最多 50 条消息（`--max-chats` / `--max-messages` 可调）。
 - 电脑上点开聊天后，手机上的未读也会被清掉；电脑上标回未读后，手机上会不会跟着变回未读还没有验证。
 

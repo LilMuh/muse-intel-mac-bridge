@@ -795,12 +795,17 @@ final class Session {
         axChatPane().flatMap { p in axChildren(p).first { axRole($0) == "AXTextArea" } }
     }
 
-    func axTitle() -> String? {
+    func axTitleElement() -> AXUIElement? {
         guard let pane = axChatPane(), let outer = axParent(pane) else { return nil }
-        return axChildren(outer).lazy.compactMap { e -> String? in
-            guard axRole(e) == "AXStaticText", let v = axStr(e, kAXValueAttribute), !v.isEmpty else { return nil }
-            return v
-        }.first
+        return axChildren(outer).first { axRole($0) == "AXStaticText" && !(axStr($0, kAXValueAttribute) ?? "").isEmpty }
+    }
+    func axTitle() -> String? { axTitleElement().flatMap { axStr($0, kAXValueAttribute) } }
+
+    /// 群聊的标题后面有一个单独的「(人数)」元素，私聊没有
+    func isGroupChat() -> Bool {
+        axTitleElement().map { axChildren($0).contains {
+            (axStr($0, kAXValueAttribute) ?? "").range(of: #"^\(\d+\)$"#, options: .regularExpression) != nil
+        } } ?? false
     }
 
     /// 聊天标题：优先读 AX，读不到才截图识别
@@ -1080,7 +1085,7 @@ final class Session {
     }
 
     /// 读这个聊天的新消息：有读取进度就读到定位点为止，没有就读最近 unread 条；最多 maxMsgs 条
-    func readNew(_ r: ChatRow, _ maxMsgs: Int) throws -> (msgs: [Msg], note: String?) {
+    func readNew(_ r: ChatRow, _ maxMsgs: Int, group: Bool) throws -> (msgs: [Msg], note: String?) {
         guard let list = axMessageList(), let box = axFrame(list) else { throw fail(5, "NO_AX", "AX 读不到聊天记录") }
         _ = waitUntil(1, 0.1) { !visibleMessages(list).isEmpty }
         let anchor = loadCursor(r.name) ?? []
@@ -1110,7 +1115,7 @@ final class Session {
         }
         saveCursor(r.name, all)
         let final = Array(result!.suffix(maxMsgs * 2))
-        if SENDERS {
+        if SENDERS && group {   // 私聊的发送人就是这个聊天本身，不用点头像
             do { try identifySenders(list, &all, all.count - final.count) }
             catch let e as WXError where e.code == 6 { throw e }
             catch let e as WXError { return (Array(all.suffix(final.count)), (note.map { $0 + "；" } ?? "") + "识别发送人中断：" + e.msg) }
@@ -1132,7 +1137,9 @@ final class Session {
             var item: [String: Any] = ["name": r.name, "unread": r.unread, "pinned": r.pinned, "muted": r.muted, "time": r.time]
             do {
                 try openRow(r.name, allow)
-                let (msgs, note) = try readNew(r, maxMsgs)
+                let group = isGroupChat()
+                item["group"] = group
+                let (msgs, note) = try readNew(r, maxMsgs, group: group)
                 item["messages"] = msgs.map { m -> [String: String] in
                     var d = ["type": m.type, "text": m.text]
                     if let v = m.from { d["from"] = v }
