@@ -157,6 +157,7 @@ let MIN_INTERVAL = envD("WX_MIN_INTERVAL", 3)
 let JITTER = max(0, envD("WX_JITTER", 2))
 let DAILY_MAX = Int(envD("WX_DAILY_MAX", 500))
 let CONFIRM = env["WX_NO_CONFIRM"] != "1"
+let SENDERS = env["WX_UNREAD_SENDERS"] != "0"   // 读未读时点头像识别发送人
 let TITLE_MINX = CGFloat(envD("WX_TITLE_MINX", 270))
 let TITLE_H = CGFloat(envD("WX_TITLE_H", 80))
 let LIST_W = CGFloat(envD("WX_LIST_W", 420))
@@ -529,7 +530,8 @@ func parseChatRow(_ raw: String, allow: [String]) -> ChatRow? {
     } else if r.muted, let n = allow.first(where: { t.hasPrefix($0 + " ") }) {
         r.name = n
         r.preview = String(t.dropFirst(n.count)).trimmingCharacters(in: .whitespaces)
-        if let m = r.preview.range(of: #"^(已置顶 )?\[(\d+)条\]"#, options: .regularExpression) {
+        if let m = r.preview.range(of: #"^(已置顶 )?(\[\d+条\]|\d+条未读)(?= |$)"#, options: .regularExpression) {
+            if r.preview.hasPrefix("已置顶 ") { r.pinned = true }
             r.unread = Int(r.preview[m].filter(\.isNumber)) ?? 0
             r.preview = String(r.preview[m.upperBound...]).trimmingCharacters(in: .whitespaces)
         }
@@ -540,7 +542,11 @@ func parseChatRow(_ raw: String, allow: [String]) -> ChatRow? {
 }
 
 /// 聊天记录里的一行
-struct Msg: Equatable { var type: String; var text: String }
+struct Msg: Equatable {
+    var type: String; var text: String
+    var from: String? = nil, sender: String? = nil, wxid: String? = nil
+    var plain: Msg { Msg(type: type, text: text) }   // 拼接和对应时只比类型和内容
+}
 
 let MSG_TIME = #"^(\d{1,2}:\d{2}|昨天.*|前天.*|星期.*|周.*|\d{1,2}月\d{1,2}日.*|\d{4}年.*|\d{1,2}/\d{1,2}.*)$"#
 
@@ -942,6 +948,86 @@ final class Session {
         throw fail(2, "NOT_FOUND", "会话列表里找不到「\(r.name)」")
     }
 
+    /// 屏幕上能看到的消息行（按从上到下），带位置
+    func visibleRows(_ list: AXUIElement) -> [(msg: Msg, frame: CGRect, raw: String)] {
+        guard let box = axFrame(list) else { return [] }
+        return axChildren(list).compactMap { e -> (Msg, CGRect, String)? in
+            guard let raw = axStr(e, kAXTitleAttribute), !raw.isEmpty, let f = axFrame(e), f.height > 0, f.intersects(box) else { return nil }
+            var t = raw
+            if t.hasSuffix(" ") { t.removeLast() }
+            let isTime = f.height < 50 && t.range(of: MSG_TIME, options: .regularExpression) != nil
+            return (Msg(type: isTime ? "time" : "message", text: t), f, raw)
+        }.sorted { $0.1.minY < $1.1.minY }
+    }
+
+    func scrollListToBottom(_ list: AXUIElement) {
+        func bottom() -> String { visibleRows(list).last?.raw ?? "" }
+        var last = bottom()
+        for _ in 0..<40 {
+            scrollList(list, -2000)
+            let now = bottom()
+            if now == last { return }
+            last = now
+        }
+    }
+
+    /// 弹出的资料卡（点头像后出现的 AXDialog 窗口）
+    func profileCard() -> AXUIElement? {
+        ((axAttr(ax, kAXWindowsAttribute) as? [AXUIElement]) ?? []).first { axStr($0, kAXSubroleAttribute) == "AXDialog" }
+    }
+
+    /// 点这个位置的头像：弹出资料卡就读出昵称和微信号，然后关掉。点击前核对该位置确实是这条消息
+    func probeAvatar(_ pt: CGPoint, _ raw: String, _ box: CGRect) throws -> (name: String, wxid: String)? {
+        guard box.contains(pt) else { return nil }
+        if profileCard() != nil { throw fail(5, "CARD_OPEN", "有资料卡没关掉，为防误点已停止") }
+        var hit: AXUIElement?
+        AXUIElementCopyElementAtPosition(AXUIElementCreateSystemWide(), Float(pt.x), Float(pt.y), &hit)
+        guard hit.flatMap({ axStr($0, kAXTitleAttribute) }) == raw else { return nil }
+        try guardFront()
+        click(pt)
+        guard waitUntil(0.6, 0.05, { profileCard() != nil }), let card = profileCard() else { return nil }
+        let texts = axChildren(card).filter { axRole($0) == "AXStaticText" }
+            .compactMap { axStr($0, kAXValueAttribute) ?? axStr($0, kAXTitleAttribute) }.filter { !$0.isEmpty }
+        let name = texts.first ?? ""
+        var wxid = ""
+        if let i = texts.firstIndex(where: { $0.hasPrefix("WeChat ID") || $0.hasPrefix("微信号") }), i + 1 < texts.count { wxid = texts[i + 1] }
+        for _ in 0..<3 where profileCard() != nil {
+            key(K_ESC)
+            _ = waitUntil(0.5, 0.05) { profileCard() == nil }
+        }
+        if profileCard() != nil { throw fail(5, "CARD_OPEN", "资料卡关不掉，为防误点已停止") }
+        return (name, wxid)
+    }
+
+    /// 给 all[start...] 里的消息识别发送人：滚到底，一页页往上，把屏幕上的行对应回记录，点头像
+    func identifySenders(_ list: AXUIElement, _ all: inout [Msg], _ start: Int) throws {
+        guard start < all.count, let box = axFrame(list) else { return }
+        scrollListToBottom(list)
+        var hi = all.count
+        for _ in 0..<15 {
+            let rows = visibleRows(list)
+            let page = rows.map { $0.msg.plain }
+            guard !page.isEmpty, let j = stride(from: min(hi, all.count) - page.count, through: 0, by: -1)
+                    .first(where: { j in j >= 0 && all[j..<(j + page.count)].map { $0.plain } == page }) else { return }
+            for (k, row) in rows.enumerated().reversed() {
+                let i = j + k
+                guard i >= start, all[i].type == "message", all[i].from == nil else { continue }
+                let f = row.frame
+                if let c = try probeAvatar(CGPoint(x: f.minX + 38, y: f.minY + 28), row.raw, box) {
+                    all[i].from = "other"; all[i].sender = c.name; all[i].wxid = c.wxid
+                } else if let c = try probeAvatar(CGPoint(x: f.maxX - 38, y: f.minY + 28), row.raw, box) {
+                    all[i].from = "me"; all[i].sender = c.name; all[i].wxid = c.wxid
+                } else if box.contains(CGPoint(x: f.minX + 38, y: f.minY + 28)) {
+                    all[i].from = "system"
+                }
+            }
+            if j <= start { return }
+            hi = j + page.count - 1
+            try guardFront()
+            scrollList(list, Int32(box.height * 0.6))
+        }
+    }
+
     /// 读这个聊天的新消息：有读取进度就读到定位点为止，没有就读最近 unread 条；最多 maxMsgs 条
     func readNew(_ r: ChatRow, _ maxMsgs: Int) throws -> (msgs: [Msg], note: String?) {
         guard let list = axMessageList(), let box = axFrame(list) else { throw fail(5, "NO_AX", "AX 读不到聊天记录") }
@@ -972,11 +1058,21 @@ final class Session {
             result = Array(all[start...])
         }
         saveCursor(r.name, all)
-        return (Array(result!.suffix(maxMsgs * 2)), note)
+        let final = Array(result!.suffix(maxMsgs * 2))
+        if SENDERS {
+            do { try identifySenders(list, &all, all.count - final.count) }
+            catch let e as WXError where e.code == 6 { throw e }
+            catch let e as WXError { return (Array(all.suffix(final.count)), (note.map { $0 + "；" } ?? "") + "识别发送人中断：" + e.msg) }
+        }
+        return (Array(all.suffix(final.count)), note)
     }
 
     /// 读所有要读的未读聊天；读完切回原来打开的聊天
     func printUnreadDetails(_ allow: [String], _ maxChats: Int, _ maxMsgs: Int) throws {
+        // 先切到前台，AX 树才有内容，才能记下原来打开的聊天
+        try activate()
+        W = try ensureWindow()
+        _ = waitUntil(1, 0.1) { axTitle() != nil }
         let original = axTitle().map { stripCount($0) }
         let (total, rows, scanned) = try scanUnread(allow)
         var chats: [[String: Any]] = [], skipped: [String] = []
@@ -986,7 +1082,13 @@ final class Session {
             do {
                 try openRow(r, allow)
                 let (msgs, note) = try readNew(r, maxMsgs)
-                item["messages"] = msgs.map { ["type": $0.type, "text": $0.text] }
+                item["messages"] = msgs.map { m -> [String: String] in
+                    var d = ["type": m.type, "text": m.text]
+                    if let v = m.from { d["from"] = v }
+                    if let v = m.sender, !v.isEmpty { d["sender"] = v }
+                    if let v = m.wxid, !v.isEmpty { d["wxid"] = v }
+                    return d
+                }
                 item["new"] = msgs.filter { $0.type == "message" }.count
                 if let n = note { item["note"] = n }
             } catch let e as WXError {
