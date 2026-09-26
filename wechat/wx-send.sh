@@ -158,6 +158,7 @@ let JITTER = max(0, envD("WX_JITTER", 2))
 let DAILY_MAX = Int(envD("WX_DAILY_MAX", 500))
 let CONFIRM = env["WX_NO_CONFIRM"] != "1"
 let SENDERS = env["WX_UNREAD_SENDERS"] != "0"   // 读未读时点头像识别发送人
+let REMARK = env["WX_UNREAD_REMARK"] != "0"     // 读完把点开过的聊天标回未读
 let TITLE_MINX = CGFloat(envD("WX_TITLE_MINX", 270))
 let TITLE_H = CGFloat(envD("WX_TITLE_H", 80))
 let LIST_W = CGFloat(envD("WX_LIST_W", 420))
@@ -924,28 +925,76 @@ final class Session {
         }.sorted { $0.0 < $1.0 }.map { $0.1 }
     }
 
-    /// 在会话列表里找到这一行并点开（点击前核对该位置确实是这一行，点开后核对标题）
-    func openRow(_ r: ChatRow, _ allow: [String]) throws {
-        guard let list = axChatList(), let box = axFrame(list) else { throw fail(5, "NO_AX", "AX 读不到会话列表") }
+    /// 在会话列表里找到完全露出来的一行（从顶部往下找），返回它的中心点；核对该位置确实是这一行
+    func findRow(_ match: (String) -> Bool) -> (raw: String, center: CGPoint)? {
+        guard let list = axChatList(), let box = axFrame(list) else { return nil }
         scrollChatListToTop(list)
         for _ in 0..<40 {
             for e in axChildren(list) {
-                guard let raw = axStr(e, kAXTitleAttribute), let f = axFrame(e), box.contains(f),
-                      parseChatRow(raw, allow: allow)?.name == r.name else { continue }
+                guard let raw = axStr(e, kAXTitleAttribute), !raw.isEmpty, let f = axFrame(e), box.contains(f), match(raw) else { continue }
                 let pt = CGPoint(x: f.midX, y: f.midY)
                 var hit: AXUIElement?
                 AXUIElementCopyElementAtPosition(AXUIElementCreateSystemWide(), Float(pt.x), Float(pt.y), &hit)
-                guard hit.flatMap({ axStr($0, kAXTitleAttribute) }) == raw else { continue }
-                try guardFront()
-                click(pt)
-                if waitUntil(TIMEOUT, 0.1, { axTitle().map { sameName($0, r.name) } ?? false }) { return }
-                throw fail(4, "TITLE_MISMATCH", "点开「\(r.name)」后标题是「\(axTitle() ?? "（无）")」，已停止")
+                if hit.flatMap({ axStr($0, kAXTitleAttribute) }) == raw { return (raw, pt) }
             }
             let before = axChildren(list).compactMap { axStr($0, kAXTitleAttribute) }
             scrollList(list, -Int32(box.height * 0.8))
             if axChildren(list).compactMap({ axStr($0, kAXTitleAttribute) }) == before { break }
         }
-        throw fail(2, "NOT_FOUND", "会话列表里找不到「\(r.name)」")
+        return nil
+    }
+
+    /// 在会话列表里找到这一行并点开，点开后核对标题
+    func openRow(_ name: String, _ allow: [String]) throws {
+        guard let row = findRow({ parseChatRow($0, allow: allow)?.name == name || $0.hasPrefix(name + " ") }) else {
+            throw fail(2, "NOT_FOUND", "会话列表里找不到「\(name)」")
+        }
+        try guardFront()
+        click(row.center)
+        if waitUntil(TIMEOUT, 0.1, { axTitle().map { sameName($0, name) } ?? false }) { return }
+        throw fail(4, "TITLE_MISMATCH", "点开「\(name)」后标题是「\(axTitle() ?? "（无）")」，已停止")
+    }
+
+    /// 右键菜单（不含菜单栏）里的菜单项
+    func contextMenuItems() -> [AXUIElement] {
+        func walk(_ e: AXUIElement, _ d: Int) -> [AXUIElement] {
+            var out: [AXUIElement] = []
+            for c in axChildren(e) {
+                let r = axRole(c)
+                if r == "AXMenuBar" { continue }
+                if r == "AXMenu" { out += axChildren(c).filter { axRole($0) == "AXMenuItem" }; continue }
+                if d < 2 { out += walk(c, d + 1) }
+            }
+            return out
+        }
+        return walk(ax, 0)
+    }
+
+    /// 右键这一行 →「标为未读」。菜单项不支持 AX 按下，只能点击：点击前核对该位置确实是「标为未读」（同一菜单里有「删除」）
+    func markUnread(_ name: String) throws -> Bool {
+        guard let row = findRow({ $0.hasPrefix(name + " ") }) else { return false }
+        try guardFront()
+        for t: CGEventType in [.mouseMoved, .rightMouseDown, .rightMouseUp] {
+            CGEvent(mouseEventSource: nil, mouseType: t, mouseCursorPosition: row.center, mouseButton: .right)?.post(tap: .cghidEventTap)
+            usleep(t == .mouseMoved ? 25_000 : 35_000)
+        }
+        var item: AXUIElement?
+        _ = waitUntil(1, 0.05) {
+            item = contextMenuItems().first { axStr($0, kAXTitleAttribute) == "标为未读" }
+            return item != nil
+        }
+        guard let it = item, let f = axFrame(it) else { key(K_ESC); return false }
+        let pt = CGPoint(x: f.midX, y: f.midY)
+        var hit: AXUIElement?
+        AXUIElementCopyElementAtPosition(AXUIElementCreateSystemWide(), Float(pt.x), Float(pt.y), &hit)
+        guard hit.flatMap({ axStr($0, kAXTitleAttribute) }) == "标为未读", axRole(hit!) == "AXMenuItem" else { key(K_ESC); return false }
+        click(pt)
+        return waitUntil(1, 0.1) {
+            (axChatList().map { axChildren($0) } ?? []).contains {
+                let t = axStr($0, kAXTitleAttribute) ?? ""
+                return t.hasPrefix(name + " ") && t.contains("条未读")
+            }
+        }
     }
 
     /// 屏幕上能看到的消息行（按从上到下），带位置
@@ -1080,7 +1129,7 @@ final class Session {
             if let a = loadCursor(r.name), let last = a.last, previewIs(r.preview, last) { skipped.append(r.name); continue }
             var item: [String: Any] = ["name": r.name, "unread": r.unread, "pinned": r.pinned, "muted": r.muted, "time": r.time]
             do {
-                try openRow(r, allow)
+                try openRow(r.name, allow)
                 let (msgs, note) = try readNew(r, maxMsgs)
                 item["messages"] = msgs.map { m -> [String: String] in
                     var d = ["type": m.type, "text": m.text]
@@ -1099,8 +1148,21 @@ final class Session {
         }
         var notes: [String] = []
         if rows.count > maxChats { notes.append("未读聊天有 \(rows.count) 个，只读了前 \(maxChats) 个") }
+        let opened = chats.filter { $0["messages"] != nil }.compactMap { $0["name"] as? String }
+        // 切回原来的聊天；原来没打开聊天的话，切到一个本来就没有未读的聊天，这样读过的聊天都能标回未读
+        var back = false
         if let o = original, !o.isEmpty {
-            do { var n: [String] = []; try openChat(o, &n) } catch { notes.append("没能切回原来的聊天「\(o)」") }
+            do { var n: [String] = []; try openChat(o, &n); back = true } catch { notes.append("没能切回原来的聊天「\(o)」") }
+        } else if !opened.isEmpty, let row = findRow({ raw in !raw.contains("条未读") && raw.range(of: #"\[\d+条\]"#, options: .regularExpression) == nil
+                                                     && !opened.contains(where: { raw.hasPrefix($0 + " ") }) }) {
+            click(row.center); usleep(500_000); back = true
+        }
+        if REMARK && back {
+            for i in chats.indices where chats[i]["messages"] != nil {
+                let name = chats[i]["name"] as! String
+                if let o = original, sameName(o, name) { chats[i]["remarked_unread"] = false; continue }
+                chats[i]["remarked_unread"] = (try? markUnread(name)) ?? false
+            }
         }
         let out: [String: Any] = ["total": total, "scanned": scanned, "chats": chats, "skipped_no_new": skipped, "notes": notes]
         let data = try JSONSerialization.data(withJSONObject: out, options: [.sortedKeys])
