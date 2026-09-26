@@ -6,6 +6,8 @@
 #   ./wx-send.sh -a work --batch 名单.tsv            批量发送（每行：联系人<Tab>消息，消息里的 \n 表示换行）
 #   ./wx-send.sh -a work --read "联系人" [条数]         读取聊天记录（JSON，默认最近 20 条，只含当前加载出来的）
 #   ./wx-send.sh -a work --unread [--list-only]          读所有未读聊天的新消息（JSON；免打扰的只读 WX_MUTED_ALLOW 里的群）
+#   ./wx-send.sh -a work --forget "联系人"               删掉某个聊天的读取进度（下次按「N条未读」重新读）
+#   ./wx-send.sh -a work --prune [天数]                  删掉 N 天（默认 3 天）没更新过的读取进度；--unread 每天会自动清一次
 #   ./wx-send.sh -a work --dump                      调试：打印识别到的标题、搜索结果、输入框、聊天底部
 #   ./wx-send.sh --list                                  列出所有微信，依次切到前台帮你辨认
 #   ./wx-send.sh --log [行数]                             查看最近的发送日志
@@ -81,7 +83,7 @@ aliases() {
   echo "${out:-无}"
 }
 
-usage() { sed -n '2,18p' "$0" | sed 's/^# \{0,1\}//' >&2; exit 64; }
+usage() { sed -n '2,20p' "$0" | sed 's/^# \{0,1\}//' >&2; exit 64; }
 
 build() {
   mkdir -p "$CACHE"
@@ -1623,6 +1625,33 @@ DispatchQueue.global(qos: .userInitiated).async {
 RunLoop.main.run()   // 主线程保持运行，截图和系统通知需要它
 SWIFT
 }
+
+# ---------- 读取进度缓存（不需要打开微信）----------
+CURSOR_DIR="$CACHE/cursor/$NAME"
+json_str() { python3 -c 'import json,sys; print(json.dumps(sys.argv[1], ensure_ascii=False))' "$1"; }
+prune() {   # 删掉 N 天没更新过的读取进度
+  local days="$1" n=0 f
+  [[ -d "$CURSOR_DIR" ]] || { echo 0; return; }
+  while IFS= read -r f; do rm -f "$f"; n=$((n + 1)); done < <(find "$CURSOR_DIR" -name '*.json' -mmin +$((days * 1440)))
+  touch "$CURSOR_DIR/.pruned"
+  echo "$n"
+}
+case "$1" in
+  --forget)
+    [[ $# -eq 2 ]] || usage
+    f="$CURSOR_DIR/$(printf %s "$2" | shasum -a 256 | cut -c1-32).json"
+    if [[ -f "$f" ]]; then rm -f "$f"; hit=true; else hit=false; fi
+    echo "{\"chat\":$(json_str "$2"),\"forgot\":$hit}"; exit 0 ;;
+  --prune)
+    days="${2:-${WX_CURSOR_DAYS:-3}}"
+    [[ "$days" =~ ^[0-9]+$ ]] || usage
+    echo "{\"days\":$days,\"removed\":$(prune "$days")}"; exit 0 ;;
+  --unread)
+    # 每天最多自动清理一次
+    if [[ -d "$CURSOR_DIR" && ( ! -f "$CURSOR_DIR/.pruned" || -n "$(find "$CURSOR_DIR/.pruned" -mmin +1440)" ) ]]; then
+      prune "${WX_CURSOR_DAYS:-3}" >/dev/null
+    fi ;;
+esac
 
 build
 
