@@ -33,6 +33,7 @@ python3 mab.py info
 
 - 读：`python3 mab.py wechat-read "联系人" -n 10 -a <账号别名>`
 - 发：`python3 mab.py wechat-send "联系人" "内容" -a <账号别名>`（加 `--dry-run` 只粘贴不发送）
+- 所有未读：`python3 mab.py wechat-unread -a <账号别名>`（只看列表不点开：加 `--list-only`）。拿到后按聊天逐个总结，群聊里按 `sender` 区分是谁说的
 - 联系人名字必须和微信里显示的完全一致。
 - 发送前先把联系人和内容复述给我，等我回复「确认」再发。
 - 返回 `status` 是 `unconfirmed_do_not_retry` 时不要重发，先用 `wechat-read` 查看是否已经发出。

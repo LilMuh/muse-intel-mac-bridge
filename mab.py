@@ -17,6 +17,9 @@ muse-intel-mac-bridge · 客户端（在 agent 的 Linux VM 里运行，只依�
   python3 mab.py key command c              # 组合键，例如 command+c
   python3 mab.py wechat-read "联系人" [-n 20] [-a work]
   python3 mab.py wechat-send "联系人" "消息" [--dry-run] [-a work]
+  python3 mab.py wechat-unread [--list-only] [-a work]
+  python3 mab.py wechat-forget "联系人" [-a work]
+  python3 mab.py wechat-prune [--days 3] [-a work]
 
 坐标 = 最近一次 screenshot 图片上的像素坐标。
 """
@@ -74,6 +77,10 @@ def main():
     wr.add_argument("-n", "--limit", type=int, default=20); wr.add_argument("-a", "--account")
     ws = sub.add_parser("wechat-send"); ws.add_argument("to"); ws.add_argument("text")
     ws.add_argument("--dry-run", action="store_true"); ws.add_argument("-a", "--account")
+    wu = sub.add_parser("wechat-unread"); wu.add_argument("--list-only", action="store_true")
+    wu.add_argument("--max-chats", type=int); wu.add_argument("--max-messages", type=int); wu.add_argument("-a", "--account")
+    wf = sub.add_parser("wechat-forget"); wf.add_argument("chat"); wf.add_argument("-a", "--account")
+    wp = sub.add_parser("wechat-prune"); wp.add_argument("--days", type=int, default=3); wp.add_argument("-a", "--account")
 
     a = ap.parse_args()
     if a.cmd == "info":
@@ -105,6 +112,15 @@ def main():
         post("/wechat/read", {"chat": a.chat, "limit": a.limit, "account": a.account}, max(TIMEOUT, 320))
     elif a.cmd == "wechat-send":
         post("/wechat/send", {"to": a.to, "text": a.text, "dry_run": a.dry_run, "account": a.account}, max(TIMEOUT, 320))
+    elif a.cmd == "wechat-unread":
+        p = {"list_only": a.list_only, "account": a.account}
+        if a.max_chats: p["max_chats"] = a.max_chats
+        if a.max_messages: p["max_messages"] = a.max_messages
+        post("/wechat/unread", p, max(TIMEOUT, 1900))
+    elif a.cmd == "wechat-forget":
+        post("/wechat/forget", {"chat": a.chat, "account": a.account})
+    elif a.cmd == "wechat-prune":
+        post("/wechat/prune", {"days": a.days, "account": a.account})
 
 
 if __name__ == "__main__":

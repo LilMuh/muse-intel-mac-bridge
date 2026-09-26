@@ -16,6 +16,9 @@ muse-intel-mac-bridge · Mac 端服务
   POST /key           {"keys":["command","c"]}
   POST /wechat/send   {"to":"联系人","text":"消息","account":"work","dry_run":false}
   POST /wechat/read   {"chat":"联系人","limit":20,"account":"work"}
+  POST /wechat/unread {"account":"work","list_only":false}   读所有未读聊天的新消息
+  POST /wechat/forget {"chat":"联系人","account":"work"}      删某个聊天的读取进度
+  POST /wechat/prune  {"days":3,"account":"work"}             删 N 天没更新的读取进度
                       微信接口调用 wx-send.sh，按名字精确匹配，不需要截图和坐标
 
 所有坐标都是「最近一次截图上的像素坐标」，服务自动换算成 macOS 逻辑坐标，
@@ -151,12 +154,12 @@ WX_STATUS = {
 }
 
 
-def run_wx(args, account=None, env=None):
+def run_wx(args, account=None, env=None, timeout=300):
     if not os.path.isfile(WX_SEND):
         raise ValueError(f"找不到 wx-send.sh：{WX_SEND}（用环境变量 WX_SEND 指定）")
     cmd = [WX_SEND] + (["-a", account] if account else []) + args
     # 排队等锁最多 180 秒，首次运行还要编译
-    r = subprocess.run(cmd, capture_output=True, text=True, timeout=300, env=dict(os.environ, **(env or {})))
+    r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout, env=dict(os.environ, **(env or {})))
     return r.returncode, r.stdout.strip(), r.stderr.strip()
 
 
@@ -187,10 +190,41 @@ def a_wechat_read(p):
     return {"ok": True, "code": 0, "status": "ok", **data}
 
 
+def wx_json(code, out, err):
+    if code != 0:
+        return {"ok": False, "code": code, "status": WX_STATUS.get(code, "error"), "output": err or out}
+    return {"ok": True, "code": 0, "status": "ok", **json.loads(out[out.index("{"):])}
+
+
+def a_wechat_unread(p):
+    env = {}
+    for k, var, hi in (("max_chats", "WX_UNREAD_MAX_CHATS", 50), ("max_messages", "WX_UNREAD_MAX_MSGS", 200)):
+        if k in p:
+            n = int(p[k])
+            if not 1 <= n <= hi:
+                raise ValueError(f"{k} 需在 1–{hi} 之间")
+            env[var] = str(n)
+    args = ["--unread"] + (["--list-only"] if p.get("list_only") else [])
+    # 要逐个点开聊天、点头像识别发送人，未读多时会很久
+    return wx_json(*run_wx(args, p.get("account"), env, timeout=1800))
+
+
+def a_wechat_forget(p):
+    return wx_json(*run_wx(["--forget", text_arg(p, "chat")], p.get("account")))
+
+
+def a_wechat_prune(p):
+    days = int(p.get("days", 3))
+    if days < 0:
+        raise ValueError("days 不能是负数")
+    return wx_json(*run_wx(["--prune", str(days)], p.get("account")))
+
+
 ACTIONS = {
     "click": a_click, "move": a_move, "drag": a_drag,
     "scroll": a_scroll, "type": a_type, "key": a_key,
     "wechat/send": a_wechat_send, "wechat/read": a_wechat_read,
+    "wechat/unread": a_wechat_unread, "wechat/forget": a_wechat_forget, "wechat/prune": a_wechat_prune,
 }
 
 

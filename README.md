@@ -102,6 +102,7 @@ python3 mab.py scroll -5 640 400            # 在 (640,400) 处向下滚动
 python3 mab.py drag 100 100 300 300         # 拖拽
 python3 mab.py wechat-read "联系人" -n 10 -a work           # 读微信聊天记录（见下文）
 python3 mab.py wechat-send "联系人" "内容" -a work          # 发微信；加 --dry-run 只粘贴不发送
+python3 mab.py wechat-unread -a work                       # 读所有未读聊天的新消息（见下文）
 ```
 
 ## 让 Muse 收发微信（可选）
@@ -180,6 +181,51 @@ python3 mab.py wechat-send "张三" "明天下午三点开会" -a work
 | `environment` | 屏幕锁定、微信没开、权限不够等 | 看 `output` 里的提示 |
 | `bad_request` | 参数不对、账号没配置，或开着多个微信却没指定 `-a` | 看 `output` 里的提示 |
 
+### 读未读消息（批量总结）
+
+`wechat-unread` 一次拿到所有未读聊天的新消息，交给 Muse 总结。
+
+**读哪些聊天：**
+- 没开免打扰的未读聊天：全部读。
+- 开了免打扰的聊天：都不读，只读白名单里的群。白名单写在 `.env` 里，群名用 `|` 分隔，所有账号共用：
+  ```bash
+  WX_MUTED_ALLOW=项目核心群|家人群
+  ```
+  也可以直接在微信里把要读的群改回「不免打扰」，这样就不用配置白名单。
+
+**它会做什么：**
+1. 从左侧「微信」标签读出未读总数；0 条就直接返回。
+2. 扫描会话列表，找出要读的聊天。
+3. 逐个点开，读新消息。每条消息都会点一下头像，从弹出的资料卡里读出发送人的昵称和微信号（`from` 是 `me` / `other` / `system`）。
+4. 切回你原来打开的聊天，把读过的聊天**标回未读**（右键 →「标为未读」）。标回后显示「1条未读」，不是原来的条数。
+
+**不会重复读：** 每个聊天会记下读到的最后 3 条消息（存在本机 `~/.cache/wx-send/cursor/`，不会上传）。下次只返回这之后的新消息；会话列表的预览和上次一样的，直接跳过，不点进去。3 天没更新的记录每天自动清理一次。
+
+**对 Muse 说：**
+
+> 用 `python3 mab.py wechat-unread -a work` 拿到所有未读消息，按聊天逐个总结，最后列出需要我回复的。
+
+只想看看有哪些聊天有未读、不点进去：`wechat-unread --list-only`。这时不会改变任何已读状态。
+
+**返回示例：**
+```json
+{"ok": true, "total": 1, "skipped_no_new": [], "notes": [],
+ "chats": [{"name": "张三", "unread": 2, "new": 2, "muted": false, "pinned": false, "time": "15:42",
+            "remarked_unread": true,
+            "messages": [{"type": "message", "text": "明天几点？", "from": "other", "sender": "张三", "wxid": "zhangsan01"}]}]}
+```
+
+**管理读取记录：**
+```bash
+python3 mab.py wechat-forget "张三" -a work     # 删掉某个聊天的读取记录，下次按「N条未读」重新读
+python3 mab.py wechat-prune --days 3 -a work    # 删掉 3 天没更新的读取记录
+```
+
+**注意：**
+- 执行期间微信会被切到前台，逐个点开聊天、点头像。未读多的时候可能要几分钟，期间不要动 Mac。
+- 每次最多读 20 个聊天、每个聊天最多 50 条消息（`--max-chats` / `--max-messages` 可调）。
+- 电脑上点开聊天后，手机上的未读也会被清掉；电脑上标回未读后，手机上会不会跟着变回未读还没有验证。
+
 ### 限制
 
 - `wechat-read` 只能读到聊天窗口里当前加载出来的消息（通常是最近十几条），也分不出每条是谁发的。
@@ -203,6 +249,9 @@ python3 mab.py wechat-send "张三" "明天下午三点开会" -a work
 | POST | `/key` | `{"keys":[...]}` | 按键或组合键 |
 | POST | `/wechat/send` | `{"to","text","account?","dry_run?"}` | 发微信（见上文） |
 | POST | `/wechat/read` | `{"chat","limit?","account?"}` | 读聊天记录，默认 20 条 |
+| POST | `/wechat/unread` | `{"account?","list_only?","max_chats?","max_messages?"}` | 读所有未读聊天的新消息 |
+| POST | `/wechat/forget` | `{"chat","account?"}` | 删掉某个聊天的读取记录 |
+| POST | `/wechat/prune` | `{"days?","account?"}` | 删掉 N 天没更新的读取记录 |
 
 注意：操作前至少要调用一次 `/screenshot`，服务才知道该用哪个坐标系。
 
@@ -219,6 +268,8 @@ python3 mab.py wechat-send "张三" "明天下午三点开会" -a work
 | `JPEG_QUALITY` | `60` | JPEG 质量，1–100 |
 | `WX_ACCOUNTS` | 空 | 微信账号，`别名=App 路径`，多个用逗号分隔 |
 | `WX_SEND` | `wechat/wx-send.sh` | 微信接口使用的脚本路径 |
+| `WX_MUTED_ALLOW` | 空 | 读未读时要读的免打扰群，用 `\|` 分隔 |
+| `WX_CURSOR_DAYS` | `3` | 读取记录保留几天 |
 
 ## 安全须知
 
@@ -263,7 +314,7 @@ The official Muse for Mac app ships as arm64-only, so on Intel Macs it fails wit
 - The agent always works in screenshot pixel coordinates; the server maps them to macOS points (Retina-aware).
 - Binds to `127.0.0.1` by default; every request needs a bearer token.
 - Works on Intel and Apple silicon, macOS 12+.
-- Optional WeChat endpoints (`/wechat/send`, `/wechat/read`) call `wx-send.sh` on the Mac to send/read messages by exact contact name, with no screenshots involved.
+- Optional WeChat endpoints (`/wechat/send`, `/wechat/read`, `/wechat/unread`) call `wx-send.sh` on the Mac to send/read messages by exact contact name, with no screenshots involved.
 
 Quick start: `./start.sh` → grant Screen Recording + Accessibility to your terminal → `./start.sh --funnel` → paste [docs/muse-prompt.md](docs/muse-prompt.md) into Muse.
 
