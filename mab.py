@@ -20,6 +20,7 @@ muse-intel-mac-bridge · 客户端（在 agent 的 Linux VM 里运行，只依�
   python3 mab.py wechat-unread [--list-only] [-a work]
   python3 mab.py wechat-forget "联系人" [-a work]
   python3 mab.py wechat-prune [--days 3] [-a work]
+  python3 mab.py wechat-friends [--accept] [-a work]
 
 坐标 = 最近一次 screenshot 图片上的像素坐标。
 """
@@ -81,6 +82,7 @@ def main():
     wu.add_argument("--max-chats", type=int); wu.add_argument("--max-messages", type=int); wu.add_argument("-a", "--account")
     wf = sub.add_parser("wechat-forget"); wf.add_argument("chat"); wf.add_argument("-a", "--account")
     wp = sub.add_parser("wechat-prune"); wp.add_argument("--days", type=int, default=3); wp.add_argument("-a", "--account")
+    wfr = sub.add_parser("wechat-friends"); wfr.add_argument("--accept", action="store_true"); wfr.add_argument("-a", "--account")
 
     a = ap.parse_args()
     if a.cmd == "info":
@@ -121,6 +123,8 @@ def main():
         post("/wechat/forget", {"chat": a.chat, "account": a.account})
     elif a.cmd == "wechat-prune":
         post("/wechat/prune", {"days": a.days, "account": a.account})
+    elif a.cmd == "wechat-friends":
+        post("/wechat/friends", {"accept": a.accept, "account": a.account}, max(TIMEOUT, 920))
 
 
 if __name__ == "__main__":

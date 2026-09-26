@@ -103,6 +103,7 @@ python3 mab.py drag 100 100 300 300         # 拖拽
 python3 mab.py wechat-read "联系人" -n 10 -a work           # 读微信聊天记录（见下文）
 python3 mab.py wechat-send "联系人" "内容" -a work          # 发微信；加 --dry-run 只粘贴不发送
 python3 mab.py wechat-unread -a work                       # 读所有未读聊天的新消息（见下文）
+python3 mab.py wechat-friends --accept -a work             # 通过所有好友申请（见下文）
 ```
 
 ## 让 Muse 收发微信（可选）
@@ -229,6 +230,33 @@ python3 mab.py wechat-prune --days 3 -a work    # 删掉 3 天没更新的读取
 - 每次最多读 20 个聊天、每个聊天最多 50 条消息（`--max-chats` / `--max-messages` 可调）。
 - 电脑上点开聊天后，手机上的未读也会被清掉；电脑上标回未读后，手机上会不会跟着变回未读还没有验证。
 
+### 通过好友申请
+
+`wechat-friends` 列出通讯录「新的朋友」里所有「等待验证」的申请；加 `--accept` 就全部通过。
+
+**通过后自动打招呼（可选）：** 在 `.env` 里写第一句话，不写就只通过、不发消息：
+```bash
+WX_FRIEND_GREETING=你好，很高兴认识你
+```
+招呼是从申请详情页点「发消息」直接进入聊天发送的，不走搜索，所以新朋友和别人重名也不会发错；发送时同样核对标题和输入框，并计入每天的发送上限。
+
+**对 Muse 说：**
+
+> 用 `python3 mab.py wechat-friends -a work` 看看有哪些好友申请；确认后用 `--accept` 全部通过。
+
+**返回示例：**
+```json
+{"ok": true, "unseen": 0, "notes": [],
+ "requests": [{"name": "张三", "message": "我是群聊\"项目群\"的张三", "source": "通过群聊添加",
+               "accepted": true, "greeting": "SENT"}]}
+```
+`greeting` 是打招呼的发送结果（`SENT` / `UNCONFIRMED` / …），没配置招呼语时没有这个字段。
+
+**注意：**
+- 每次最多处理 10 条申请；每两次通过之间随机等 3–8 秒，防风控。
+- 通过的新朋友如果和已有好友同名，以后按名字 `wechat-send` 会返回 `duplicate_name`，给其中一个设个备注就好。
+- 通过的记录会写进发送日志（`FRIEND_ACCEPTED`）。
+
 ### 限制
 
 - `wechat-read` 只能读到聊天窗口里当前加载出来的消息（通常是最近十几条），也分不出每条是谁发的。
@@ -255,6 +283,7 @@ python3 mab.py wechat-prune --days 3 -a work    # 删掉 3 天没更新的读取
 | POST | `/wechat/unread` | `{"account?","list_only?","max_chats?","max_messages?"}` | 读所有未读聊天的新消息 |
 | POST | `/wechat/forget` | `{"chat","account?"}` | 删掉某个聊天的读取记录 |
 | POST | `/wechat/prune` | `{"days?","account?"}` | 删掉 N 天没更新的读取记录 |
+| POST | `/wechat/friends` | `{"account?","accept?"}` | 列出 / 通过好友申请 |
 
 注意：操作前至少要调用一次 `/screenshot`，服务才知道该用哪个坐标系。
 
@@ -273,6 +302,7 @@ python3 mab.py wechat-prune --days 3 -a work    # 删掉 3 天没更新的读取
 | `WX_SEND` | `wechat/wx-send.sh` | 微信接口使用的脚本路径 |
 | `WX_MUTED_ALLOW` | 空 | 读未读时要读的免打扰群，用 `\|` 分隔 |
 | `WX_CURSOR_DAYS` | `3` | 读取记录保留几天 |
+| `WX_FRIEND_GREETING` | 空 | 通过好友申请后自动发的第一句话 |
 
 ## 安全须知
 
@@ -317,7 +347,7 @@ The official Muse for Mac app ships as arm64-only, so on Intel Macs it fails wit
 - The agent always works in screenshot pixel coordinates; the server maps them to macOS points (Retina-aware).
 - Binds to `127.0.0.1` by default; every request needs a bearer token.
 - Works on Intel and Apple silicon, macOS 12+.
-- Optional WeChat endpoints (`/wechat/send`, `/wechat/read`, `/wechat/unread`) call `wx-send.sh` on the Mac to send/read messages by exact contact name, with no screenshots involved.
+- Optional WeChat endpoints (`/wechat/send`, `/wechat/read`, `/wechat/unread`, `/wechat/friends`) call `wx-send.sh` on the Mac to send/read messages by exact contact name, with no screenshots involved.
 
 Quick start: `./start.sh` → grant Screen Recording + Accessibility to your terminal → `./start.sh --funnel` → paste [docs/muse-prompt.md](docs/muse-prompt.md) into Muse.
 

@@ -6,6 +6,7 @@
 #   ./wx-send.sh -a work --batch 名单.tsv            批量发送（每行：联系人<Tab>消息，消息里的 \n 表示换行）
 #   ./wx-send.sh -a work --read "联系人" [条数]         读取聊天记录（JSON，默认最近 20 条，只含当前加载出来的）
 #   ./wx-send.sh -a work --unread [--list-only]          读所有未读聊天的新消息（JSON；免打扰的只读 WX_MUTED_ALLOW 里的群）
+#   ./wx-send.sh -a work --friends [--accept]            列出（加 --accept 则通过）等待验证的好友申请；通过后发 WX_FRIEND_GREETING
 #   ./wx-send.sh -a work --forget "联系人"               删掉某个聊天的读取进度（下次按「N条未读」重新读）
 #   ./wx-send.sh -a work --prune [天数]                  删掉 N 天（默认 3 天）没更新过的读取进度；--unread 每天会自动清一次
 #   ./wx-send.sh -a work --dump                      调试：打印识别到的标题、搜索结果、输入框、聊天底部
@@ -56,6 +57,10 @@ if [[ -z "${WX_MUTED_ALLOW:-}" && -f "$DIR/../.env" ]]; then
   WX_MUTED_ALLOW="$(sed -n 's/^WX_MUTED_ALLOW=//p' "$DIR/../.env" | tail -n 1 | sed "s/^[\"']//; s/[\"']\$//")"
 fi
 export WX_MUTED_ALLOW="${WX_MUTED_ALLOW:-}"
+if [[ -z "${WX_FRIEND_GREETING:-}" && -f "$DIR/../.env" ]]; then
+  WX_FRIEND_GREETING="$(sed -n 's/^WX_FRIEND_GREETING=//p' "$DIR/../.env" | tail -n 1 | sed "s/^[\"']//; s/[\"']\$//")"
+fi
+export WX_FRIEND_GREETING="${WX_FRIEND_GREETING:-}"
 ACCOUNTS=()
 [[ -n "${WX_ACCOUNTS:-}" ]] && IFS=',' read -ra ACCOUNTS <<< "$WX_ACCOUNTS"
 
@@ -83,7 +88,7 @@ aliases() {
   echo "${out:-无}"
 }
 
-usage() { sed -n '2,20p' "$0" | sed 's/^# \{0,1\}//' >&2; exit 64; }
+usage() { sed -n '2,21p' "$0" | sed 's/^# \{0,1\}//' >&2; exit 64; }
 
 build() {
   mkdir -p "$CACHE"
@@ -1178,6 +1183,145 @@ final class Session {
         say(String(data: data, encoding: .utf8)!)
     }
 
+    // MARK: 好友申请
+
+    func axTabButton(_ title: String) -> AXUIElement? {
+        axMainWindow().flatMap { axFind($0, 0, { axRole($0) == "AXButton" && axStr($0, kAXTitleAttribute) == title }) }
+    }
+
+    /// 点击前核对：该位置的元素（或它的上一级）就是这个名字
+    func clickVerified(_ e: AXUIElement, _ label: String) throws -> Bool {
+        guard let f = axFrame(e) else { return false }
+        let pt = CGPoint(x: f.midX, y: f.midY)
+        var hit: AXUIElement?
+        AXUIElementCopyElementAtPosition(AXUIElementCreateSystemWide(), Float(pt.x), Float(pt.y), &hit)
+        func name(_ x: AXUIElement?) -> String? { x.flatMap { axStr($0, kAXTitleAttribute) ?? axStr($0, kAXValueAttribute) } }
+        guard name(hit) == label || name(hit.flatMap { axParent($0) }) == label else { return false }
+        try guardFront()
+        click(pt)
+        return true
+    }
+
+    /// 「通讯录」标签描述里的「N 条新朋友申请」
+    func friendRequestCount() -> Int {
+        guard let d = axTabButton("通讯录").flatMap({ axStr($0, kAXDescriptionAttribute) }),
+              let m = d.range(of: #"\d+(?= *条新朋友申请)"#, options: .regularExpression) else { return 0 }
+        return Int(d[m]) ?? 0
+    }
+
+    func axContactList() -> AXUIElement? {
+        axMainWindow().flatMap { axFind($0, 0, { axRole($0) == "AXList" && axStr($0, kAXTitleAttribute) == "通讯录" }) }
+    }
+
+    /// 右侧详情里的文字（按从上到下）
+    func detailTexts(_ list: AXUIElement) -> [String] {
+        guard let lf = axFrame(list), let split = axParent(list) else { return [] }
+        return axChildren(split).compactMap { e -> (CGFloat, String)? in
+            guard axRole(e) == "AXStaticText", let f = axFrame(e), f.minX > lf.maxX,
+                  let t = axStr(e, kAXValueAttribute) ?? axStr(e, kAXTitleAttribute), !t.isEmpty else { return nil }
+            return (f.minY, t)
+        }.sorted { $0.0 < $1.0 }.map { $0.1 }
+    }
+    func detailButton(_ list: AXUIElement, _ title: String) -> AXUIElement? {
+        guard let lf = axFrame(list), let split = axParent(list) else { return nil }
+        return axChildren(split).first { axRole($0) == "AXButton" && axStr($0, kAXTitleAttribute) == title && (axFrame($0)?.minX ?? 0) > lf.maxX }
+    }
+
+    /// 通过一条好友申请：点「前往验证」→ 在「通过朋友验证」窗口点「确定」→ 核对这一行变成「已添加」
+    func acceptRequest(_ list: AXUIElement, _ name: String) throws -> Bool {
+        guard let go = detailButton(list, "前往验证"), try clickVerified(go, "前往验证") else { return false }
+        func dialog() -> AXUIElement? {
+            ((axAttr(ax, kAXWindowsAttribute) as? [AXUIElement]) ?? []).first { axStr($0, kAXTitleAttribute) == "通过朋友验证" }
+        }
+        guard waitUntil(3, 0.1, { dialog() != nil }), let d = dialog() else { return false }
+        AXUIElementPerformAction(d, kAXRaiseAction as CFString)
+        usleep(200_000)
+        guard let ok = axChildren(d).first(where: { axRole($0) == "AXButton" && axStr($0, kAXTitleAttribute) == "确定" }),
+              try clickVerified(ok, "确定") else {
+            // 核对不通过：点「取消」关掉，不通过
+            if let c = axChildren(d).first(where: { axRole($0) == "AXButton" && axStr($0, kAXTitleAttribute) == "取消" }) { _ = try? clickVerified(c, "取消") }
+            return false
+        }
+        guard waitUntil(5, 0.2, { dialog() == nil }) else { return false }
+        return waitUntil(5, 0.2) {
+            axChildren(list).contains { e in
+                let t = axStr(e, kAXTitleAttribute) ?? ""
+                return t.hasPrefix(name) && t.hasSuffix("已添加")
+            }
+        }
+    }
+
+    /// 列出（accept=true 时通过）所有等待验证的好友申请；通过后如果配置了 WX_FRIEND_GREETING 就发第一句话
+    func handleFriendRequests(_ accept: Bool) throws {
+        try activate()
+        W = try ensureWindow()
+        _ = waitUntil(1, 0.1) { axTitle() != nil }
+        let original = axTitle().map { stripCount($0) }
+        // 标签上的「N 条新朋友申请」只算还没看过的，看过的申请不计入，所以每次都要进列表找「等待验证」
+        let unseen = friendRequestCount()
+        var items: [[String: Any]] = [], notes: [String] = []
+        do {
+            guard let tab = axTabButton("通讯录"), try clickVerified(tab, "通讯录"),
+                  waitUntil(2, 0.1, { axContactList() != nil }), let list = axContactList() else {
+                throw fail(5, "NO_AX", "打不开通讯录")
+            }
+            scrollChatListToTop(list)
+            let greeting = (env["WX_FRIEND_GREETING"] ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+            var done = Set<String>()
+            for _ in 0..<10 {
+                // 每次都重新找：通过一条后列表会变
+                guard let row = axChildren(list).first(where: { e in
+                    let t = axStr(e, kAXTitleAttribute) ?? ""
+                    return t.hasSuffix("等待验证") && !done.contains(t) && (axFrame(e).map { f in axFrame(list)?.contains(f) ?? false } ?? false)
+                }), let raw = axStr(row, kAXTitleAttribute) else { break }
+                done.insert(raw)
+                guard try clickVerified(row, raw) else { notes.append("点不到申请「\(raw)」"); continue }
+                _ = waitUntil(2, 0.1) { detailButton(list, "前往验证") != nil }
+                let texts = detailTexts(list)
+                let name = texts.first ?? ""
+                var item: [String: Any] = ["name": name]
+                if let m = texts.first(where: { $0.hasPrefix(name + ": ") || $0.hasPrefix(name + "：") }) { item["message"] = String(m.dropFirst(name.count + 2)) }
+                if let i = texts.firstIndex(of: "来源"), i + 1 < texts.count { item["source"] = texts[i + 1] }
+                // 详情和这一行必须是同一个人
+                guard !name.isEmpty, raw.hasPrefix(name) else { item["error"] = "详情和申请对不上，已跳过"; items.append(item); continue }
+                if accept {
+                    if !items.filter({ $0["accepted"] as? Bool == true }).isEmpty { sleepS(Double.random(in: 3...8)) }   // 防风控
+                    let ok = try acceptRequest(list, name)
+                    item["accepted"] = ok
+                    writeLog(account, name, ok ? "FRIEND_ACCEPTED" : "FAILED:FRIEND_ACCEPT", "0", (item["source"] as? String) ?? "", (item["message"] as? String) ?? "")
+                    if ok && !greeting.isEmpty {
+                        item["greeting"] = try greet(list, name, greeting)
+                        // 发完回到通讯录继续处理下一条
+                        if let t = axTabButton("通讯录") { _ = try clickVerified(t, "通讯录"); _ = waitUntil(2, 0.1) { axContactList() != nil } }
+                    }
+                }
+                items.append(item)
+            }
+        }
+        if let t = axTabButton("WeChat") { _ = try? clickVerified(t, "WeChat"); _ = waitUntil(1, 0.1) { axChatList() != nil } }
+        if let o = original, !o.isEmpty, axTitle().map({ !sameName($0, o) }) ?? true {
+            do { var n: [String] = []; try openChat(o, &n) } catch { notes.append("没能切回原来的聊天「\(o)」") }
+        }
+        let out: [String: Any] = ["unseen": unseen, "requests": items, "notes": notes]
+        let data = try JSONSerialization.data(withJSONObject: out, options: [.sortedKeys])
+        say(String(data: data, encoding: .utf8)!)
+    }
+
+    /// 通过后打招呼：从详情页点「发消息」进聊天（不走搜索，避免新朋友和别人重名），再按正常流程发送
+    func greet(_ list: AXUIElement, _ name: String, _ msg: String) throws -> String {
+        if !DRY_RUN && sentToday(account) >= DAILY_MAX { return "今天的发送数已达上限，没有打招呼" }
+        _ = waitUntil(3, 0.1) { detailButton(list, "发消息") != nil }
+        guard let b = detailButton(list, "发消息"), try clickVerified(b, "发消息") else { return "找不到「发消息」按钮，没有打招呼" }
+        guard waitUntil(TIMEOUT, 0.1, { axTitle().map { sameName($0, name) } ?? false }) else {
+            return "打开的聊天标题是「\(axTitle() ?? "（无）")」，不是「\(name)」，没有打招呼"
+        }
+        if !DRY_RUN { rateLimit(account) }
+        let t0 = Date()
+        let (st, info) = try sendInChat(name, msg, ["新好友打招呼"])
+        writeLog(account, name, st, String(format: "%.1f", Date().timeIntervalSince(t0)), info, msg)
+        return st
+    }
+
     func printUnreadList(_ allow: [String]) throws {
         let (total, chats, scanned) = try scanUnread(allow)
         let items: [[String: Any]] = chats.map { ["name": $0.name, "unread": $0.unread, "pinned": $0.pinned,
@@ -1334,6 +1478,13 @@ final class Session {
         if msg.isEmpty { throw fail(64, "EMPTY_MSG", "消息是空的") }
         var notes: [String] = []
         try openChat(contact, &notes)
+        return try sendInChat(contact, msg, notes)
+    }
+
+    /// 在已经打开的聊天里发送（聊天标题已经核对过）
+    func sendInChat(_ contact: String, _ msg: String, _ notesIn: [String]) throws -> (String, String) {
+        var notes = notesIn
+        W = try ensureWindow()
 
         // 2. 输入框：必须为空，粘贴后必须能看到消息
         try guardFront()
@@ -1515,6 +1666,19 @@ func run(_ args: [String]) -> Int32 {
         try checkEnvironment()
         let session = Session(app: try findApp(appPath), account: account)
         if mode == "dump" { try session.dump(); return 0 }
+        if mode == "friends" {
+            let lockFd = try acquireLock()
+            defer { close(lockFd) }
+            let clip = ClipboardBackup()
+            clipBackup = clip
+            let mouse = CGEvent(source: nil)?.location
+            defer {
+                clip.restore()
+                if let m = mouse { moveMouse(m) }
+            }
+            try session.handleFriendRequests(args.count > 3 && args[3] == "accept")
+            return 0
+        }
         if mode == "unread" {
             let allow = (env["WX_MUTED_ALLOW"] ?? "").split(separator: "|")
                 .map { $0.trimmingCharacters(in: .whitespaces) }.filter { !$0.isEmpty }
@@ -1666,6 +1830,7 @@ case "$1" in
   --dump)  exec "$BIN" dump "$NAME" "$APP" ;;
   --batch) [[ $# -eq 2 ]] || usage; exec "$BIN" batch "$NAME" "$APP" "$2" ;;
   --read)  [[ $# -ge 2 && $# -le 3 ]] || usage; exec "$BIN" read "$NAME" "$APP" "$2" "${3:-20}" ;;
+  --friends) exec "$BIN" friends "$NAME" "$APP" "$([[ "${2:-}" == "--accept" ]] && echo accept || echo list)" ;;
   --unread) exec "$BIN" unread "$NAME" "$APP" "$([[ "${2:-}" == "--list-only" ]] && echo list || echo details)" ;;
   -*)      usage ;;
   *)       [[ $# -eq 2 ]] || usage; exec "$BIN" send "$NAME" "$APP" "$1" "$2" ;;

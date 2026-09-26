@@ -19,6 +19,7 @@ muse-intel-mac-bridge · Mac 端服务
   POST /wechat/unread {"account":"work","list_only":false}   读所有未读聊天的新消息
   POST /wechat/forget {"chat":"联系人","account":"work"}      删某个聊天的读取进度
   POST /wechat/prune  {"days":3,"account":"work"}             删 N 天没更新的读取进度
+  POST /wechat/friends {"account":"work","accept":false}      列出（accept=true 时通过）好友申请
                       微信接口调用 wx-send.sh，按名字精确匹配，不需要截图和坐标
 
 所有坐标都是「最近一次截图上的像素坐标」，服务自动换算成 macOS 逻辑坐标，
@@ -32,6 +33,7 @@ Retina 缩放与截图缩放比例 agent 都无需关心。
   JPEG_QUALITY  默认 60
   WX_SEND       wx-send.sh 的路径，默认用仓库里的 wechat/wx-send.sh
   WX_ACCOUNTS   微信账号：别名=App 路径，多个用逗号分隔（只开一个微信可不填）
+  WX_FRIEND_GREETING  通过好友申请后自动发的第一句话（不填就不发）
 """
 import hmac
 import json
@@ -220,11 +222,18 @@ def a_wechat_prune(p):
     return wx_json(*run_wx(["--prune", str(days)], p.get("account")))
 
 
+def a_wechat_friends(p):
+    args = ["--friends"] + (["--accept"] if p.get("accept") else [])
+    # 每条申请之间随机等 3–8 秒，通过后还要打招呼
+    return wx_json(*run_wx(args, p.get("account"), timeout=900))
+
+
 ACTIONS = {
     "click": a_click, "move": a_move, "drag": a_drag,
     "scroll": a_scroll, "type": a_type, "key": a_key,
     "wechat/send": a_wechat_send, "wechat/read": a_wechat_read,
     "wechat/unread": a_wechat_unread, "wechat/forget": a_wechat_forget, "wechat/prune": a_wechat_prune,
+    "wechat/friends": a_wechat_friends,
 }
 
 

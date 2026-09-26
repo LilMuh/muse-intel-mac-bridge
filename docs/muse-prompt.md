@@ -33,6 +33,7 @@ python3 mab.py info
 
 - 读：`python3 mab.py wechat-read "联系人" -n 10 -a <账号别名>`
 - 发：`python3 mab.py wechat-send "联系人" "内容" -a <账号别名>`（加 `--dry-run` 只粘贴不发送）
+- 好友申请：`python3 mab.py wechat-friends -a <账号别名>` 列出，`--accept` 全部通过（通过后会自动发 .env 里配置的招呼语）
 - 所有未读：`python3 mab.py wechat-unread -a <账号别名>`（只看列表不点开：加 `--list-only`）。拿到后按聊天逐个总结，群聊里按 `sender` 区分是谁说的
 - 联系人名字必须和微信里显示的完全一致。
 - 发送前先把联系人和内容复述给我，等我回复「确认」再发。
