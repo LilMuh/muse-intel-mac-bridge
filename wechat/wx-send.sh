@@ -5,6 +5,7 @@
 #   ./wx-send.sh -a work "联系人或群名" "消息内容"     发送
 #   ./wx-send.sh -a work --batch 名单.tsv            批量发送（每行：联系人<Tab>消息，消息里的 \n 表示换行）
 #   ./wx-send.sh -a work --read "联系人" [条数]         读取聊天记录（JSON，默认最近 20 条，只含当前加载出来的）
+#   ./wx-send.sh -a work --unread                        列出未读聊天（JSON；免打扰的只列 WX_MUTED_ALLOW 里的群）
 #   ./wx-send.sh -a work --dump                      调试：打印识别到的标题、搜索结果、输入框、聊天底部
 #   ./wx-send.sh --list                                  列出所有微信，依次切到前台帮你辨认
 #   ./wx-send.sh --log [行数]                             查看最近的发送日志
@@ -49,6 +50,10 @@ DIR="$(cd "$(dirname "$0")" && pwd)"
 if [[ -z "${WX_ACCOUNTS:-}" && -f "$DIR/../.env" ]]; then
   WX_ACCOUNTS="$(sed -n 's/^WX_ACCOUNTS=//p' "$DIR/../.env" | tail -n 1 | sed "s/^[\"']//; s/[\"']\$//")"
 fi
+if [[ -z "${WX_MUTED_ALLOW:-}" && -f "$DIR/../.env" ]]; then
+  WX_MUTED_ALLOW="$(sed -n 's/^WX_MUTED_ALLOW=//p' "$DIR/../.env" | tail -n 1 | sed "s/^[\"']//; s/[\"']\$//")"
+fi
+export WX_MUTED_ALLOW="${WX_MUTED_ALLOW:-}"
 ACCOUNTS=()
 [[ -n "${WX_ACCOUNTS:-}" ]] && IFS=',' read -ra ACCOUNTS <<< "$WX_ACCOUNTS"
 
@@ -76,7 +81,7 @@ aliases() {
   echo "${out:-无}"
 }
 
-usage() { sed -n '2,17p' "$0" | sed 's/^# \{0,1\}//' >&2; exit 64; }
+usage() { sed -n '2,18p' "$0" | sed 's/^# \{0,1\}//' >&2; exit 64; }
 
 build() {
   mkdir -p "$CACHE"
@@ -503,6 +508,36 @@ func sameInput(_ seen: String, _ msg: String) -> Bool {
     return seen.range(of: pattern, options: .regularExpression) != nil
 }
 
+/// 会话列表里的一行：「名字 [已置顶] [N条未读] 预览 时间[消息免打扰]」
+struct ChatRow { var name = ""; var unread = 0; var pinned = false; var muted = false; var preview = ""; var time = "" }
+
+let ROW_TIME = #"\s(\d{1,2}:\d{2}|昨天(?: \d{1,2}:\d{2})?|前天|星期.|\d{1,2}/\d{1,2}|\d{2,4}/\d{1,2}/\d{1,2})$"#
+
+/// 解析会话行。只有带「N条未读」的行才能可靠地拆出名字；免打扰的群要靠白名单里的名字来匹配
+func parseChatRow(_ raw: String, allow: [String]) -> ChatRow? {
+    var r = ChatRow()
+    var t = raw.trimmingCharacters(in: .whitespaces)
+    if t.hasSuffix("消息免打扰") { r.muted = true; t = String(t.dropLast(5)).trimmingCharacters(in: .whitespaces) }
+    if let m = t.range(of: ROW_TIME, options: .regularExpression) {
+        r.time = t[m].trimmingCharacters(in: .whitespaces); t = String(t[..<m.lowerBound])
+    }
+    if !r.muted, let m = t.range(of: #" (\d+)条未读(?= |$)"#, options: .regularExpression) {
+        r.unread = Int(t[m].filter(\.isNumber)) ?? 0
+        r.name = String(t[..<m.lowerBound])
+        r.preview = String(t[m.upperBound...]).trimmingCharacters(in: .whitespaces)
+    } else if r.muted, let n = allow.first(where: { t.hasPrefix($0 + " ") }) {
+        r.name = n
+        r.preview = String(t.dropFirst(n.count)).trimmingCharacters(in: .whitespaces)
+        if let m = r.preview.range(of: #"^(已置顶 )?\[(\d+)条\]"#, options: .regularExpression) {
+            r.unread = Int(r.preview[m].filter(\.isNumber)) ?? 0
+            r.preview = String(r.preview[m.upperBound...]).trimmingCharacters(in: .whitespaces)
+        }
+    } else { return nil }
+    for tag in [" 已置顶"] where r.name.hasSuffix(tag) { r.pinned = true; r.name = String(r.name.dropLast(tag.count)) }
+    if r.preview.hasPrefix("已置顶 ") { r.pinned = true; r.preview = String(r.preview.dropFirst(4)) }
+    return r.name.isEmpty ? nil : r
+}
+
 /// 聊天标题。exact=true 表示来自 AX 原文，按完全一致比较；false 表示来自截图识别
 struct Title { let text: String; let exact: Bool }
 
@@ -739,6 +774,88 @@ final class Session {
 
     /// 截图识别出的标题被截断成「…」
     func truncated(_ t: Title) -> Bool { !t.exact && (t.text.hasSuffix("…") || t.text.hasSuffix("...")) }
+
+    func axMainWindow() -> AXUIElement? {
+        ((axAttr(ax, kAXWindowsAttribute) as? [AXUIElement]) ?? []).first { axStr($0, kAXSubroleAttribute) == "AXStandardWindow" }
+    }
+    func axChatList() -> AXUIElement? {
+        axMainWindow().flatMap { axFind($0, 0, { axRole($0) == "AXList" && axStr($0, kAXTitleAttribute) == "会话" }) }
+    }
+    /// 左侧「微信」标签按钮，描述里是「N条新消息」（不含免打扰的）
+    func axChatsTab() -> AXUIElement? {
+        axMainWindow().flatMap { axFind($0, 0, { axRole($0) == "AXButton" && axStr($0, kAXTitleAttribute) == "WeChat" }) }
+    }
+    func unreadTotal() -> Int {
+        guard let d = axChatsTab().flatMap({ axStr($0, kAXDescriptionAttribute) }),
+              let m = d.range(of: #"\d+(?=条新消息)"#, options: .regularExpression) else { return 0 }
+        return Int(d[m]) ?? 0
+    }
+    /// 在会话列表上滚动（正数向上，单位：点）；列表不支持用 AX 滚动，只能发滚轮事件
+    func scrollChatList(_ list: AXUIElement, _ dy: Int32) {
+        guard let f = axFrame(list) else { return }
+        moveMouse(CGPoint(x: f.midX, y: f.midY)); usleep(30_000)
+        CGEvent(scrollWheelEvent2Source: nil, units: .pixel, wheelCount: 1, wheel1: dy, wheel2: 0, wheel3: 0)?.post(tap: .cghidEventTap)
+        usleep(250_000)
+    }
+
+    /// 一直往上滚，直到可见的第一行不再变化（一次滚太多会被限幅，所以不能只滚一次）
+    func scrollChatListToTop(_ list: AXUIElement) {
+        func top() -> String {
+            axChildren(list).compactMap { e -> (CGFloat, String)? in
+                guard let t = axStr(e, kAXTitleAttribute), !t.isEmpty, let f = axFrame(e) else { return nil }
+                return (f.minY, t)
+            }.min { $0.0 < $1.0 }?.1 ?? ""
+        }
+        var last = top()
+        for _ in 0..<80 {
+            scrollChatList(list, 2000)
+            let now = top()
+            if now == last { return }
+            last = now
+        }
+    }
+
+    /// 扫描会话列表里要读的未读聊天：没开免打扰的全部要；免打扰的只要白名单里的
+    func scanUnread(_ allow: [String]) throws -> (total: Int, chats: [ChatRow], scanned: Int) {
+        try activate()
+        W = try ensureWindow()
+        if axChatList() == nil, let tab = axChatsTab(), let f = axFrame(tab) {   // 不在「微信」标签页：点一下切过去
+            click(CGPoint(x: f.midX, y: f.midY))
+            _ = waitUntil(1, 0.1) { axChatList() != nil }
+        }
+        guard let list = axChatList(), let box = axFrame(list) else { throw fail(5, "NO_AX", "AX 读不到会话列表") }
+        let total = unreadTotal()
+        if total == 0 && allow.isEmpty { return (0, [], 0) }
+        scrollChatListToTop(list)
+        var seen = Set<String>(), found = Set<String>(), out: [ChatRow] = [], sum = 0
+        for _ in 0..<40 {
+            var fresh = 0
+            for row in axChildren(list) {
+                guard let raw = axStr(row, kAXTitleAttribute), !raw.isEmpty, !seen.contains(raw) else { continue }
+                seen.insert(raw); fresh += 1
+                guard let r = parseChatRow(raw, allow: allow) else { continue }
+                if r.muted { found.insert(r.name) }
+                guard r.unread > 0 else { continue }
+                out.append(r)
+                if !r.muted { sum += r.unread }
+            }
+            // 没开免打扰的未读条数凑够了总数，白名单里的群也都找到了 → 后面不会再有要读的
+            if sum >= total && found.count == Set(allow).count { break }
+            if fresh == 0 || seen.count >= 200 { break }   // 到底了
+            try guardFront()
+            scrollChatList(list, -Int32(box.height * 0.8))
+        }
+        scrollChatListToTop(list)
+        return (total, out, seen.count)
+    }
+
+    func printUnreadList(_ allow: [String]) throws {
+        let (total, chats, scanned) = try scanUnread(allow)
+        let items: [[String: Any]] = chats.map { ["name": $0.name, "unread": $0.unread, "pinned": $0.pinned,
+                                                  "muted": $0.muted, "preview": $0.preview, "time": $0.time] }
+        let data = try JSONSerialization.data(withJSONObject: ["total": total, "scanned": scanned, "chats": items], options: [.sortedKeys])
+        say(String(data: data, encoding: .utf8)!)
+    }
 
     func axSearchText() -> String? {
         let wins = (axAttr(ax, kAXWindowsAttribute) as? [AXUIElement]) ?? []
@@ -1069,6 +1186,16 @@ func run(_ args: [String]) -> Int32 {
         try checkEnvironment()
         let session = Session(app: try findApp(appPath), account: account)
         if mode == "dump" { try session.dump(); return 0 }
+        if mode == "unread" {
+            let allow = (env["WX_MUTED_ALLOW"] ?? "").split(separator: "|")
+                .map { $0.trimmingCharacters(in: .whitespaces) }.filter { !$0.isEmpty }
+            let lockFd = try acquireLock()
+            defer { close(lockFd) }
+            let mouse = CGEvent(source: nil)?.location
+            defer { if let m = mouse { moveMouse(m) } }
+            try session.printUnreadList(allow)
+            return 0
+        }
         if mode == "read" {
             guard args.count == 5, let n = Int(args[4]), n > 0 else { eprint("内部参数错误"); return 64 }
             let lockFd = try acquireLock()
@@ -1177,6 +1304,7 @@ case "$1" in
   --dump)  exec "$BIN" dump "$NAME" "$APP" ;;
   --batch) [[ $# -eq 2 ]] || usage; exec "$BIN" batch "$NAME" "$APP" "$2" ;;
   --read)  [[ $# -ge 2 && $# -le 3 ]] || usage; exec "$BIN" read "$NAME" "$APP" "$2" "${3:-20}" ;;
+  --unread) exec "$BIN" unread "$NAME" "$APP" ;;
   -*)      usage ;;
   *)       [[ $# -eq 2 ]] || usage; exec "$BIN" send "$NAME" "$APP" "$1" "$2" ;;
 esac
