@@ -5,7 +5,7 @@
 #   ./wx-send.sh -a work "联系人或群名" "消息内容"     发送
 #   ./wx-send.sh -a work --batch 名单.tsv            批量发送（每行：联系人<Tab>消息，消息里的 \n 表示换行）
 #   ./wx-send.sh -a work --read "联系人" [条数]         读取聊天记录（JSON，默认最近 20 条，只含当前加载出来的）
-#   ./wx-send.sh -a work --unread                        列出未读聊天（JSON；免打扰的只列 WX_MUTED_ALLOW 里的群）
+#   ./wx-send.sh -a work --unread [--list-only]          读所有未读聊天的新消息（JSON；免打扰的只读 WX_MUTED_ALLOW 里的群）
 #   ./wx-send.sh -a work --dump                      调试：打印识别到的标题、搜索结果、输入框、聊天底部
 #   ./wx-send.sh --list                                  列出所有微信，依次切到前台帮你辨认
 #   ./wx-send.sh --log [行数]                             查看最近的发送日志
@@ -145,6 +145,7 @@ import CoreGraphics
 import ApplicationServices
 import CoreServices
 import ScreenCaptureKit
+import CryptoKit
 
 // MARK: - 配置
 
@@ -538,6 +539,39 @@ func parseChatRow(_ raw: String, allow: [String]) -> ChatRow? {
     return r.name.isEmpty ? nil : r
 }
 
+/// 聊天记录里的一行
+struct Msg: Equatable { var type: String; var text: String }
+
+let MSG_TIME = #"^(\d{1,2}:\d{2}|昨天.*|前天.*|星期.*|周.*|\d{1,2}月\d{1,2}日.*|\d{4}年.*|\d{1,2}/\d{1,2}.*)$"#
+
+/// 往上翻一页后，把新看到的一页拼到已有记录前面：找新一页尾部和已有记录头部的最长重叠
+func prependPage(_ all: [Msg], _ page: [Msg]) -> [Msg]? {
+    if all.isEmpty { return page }
+    for k in stride(from: min(page.count, all.count), through: 1, by: -1)
+        where Array(page.suffix(k)) == Array(all.prefix(k)) {
+        return Array(page.dropLast(k)) + all
+    }
+    return nil
+}
+
+/// 定位点（上次读到的最后几条消息）之后的记录；找不到定位点返回 nil
+func afterAnchor(_ all: [Msg], _ anchor: [String]) -> [Msg]? {
+    guard !anchor.isEmpty else { return nil }
+    let idx = all.indices.filter { all[$0].type == "message" }
+    guard idx.count >= anchor.count else { return nil }
+    for j in stride(from: idx.count - anchor.count, through: 0, by: -1)
+        where (0..<anchor.count).allSatisfy({ all[idx[j + $0]].text == anchor[$0] }) {
+        return Array(all[(idx[j + anchor.count - 1] + 1)...])
+    }
+    return nil
+}
+
+/// 会话列表的预览是不是就是这条消息（群里的预览是「发送人: 内容」，图片是「[图片]」）
+func previewIs(_ preview: String, _ text: String) -> Bool {
+    let p = preview.trimmingCharacters(in: .whitespaces)
+    return p == text || p.hasSuffix(": " + text) || p == "[" + text + "]" || p.hasSuffix(": [" + text + "]")
+}
+
 /// 聊天标题。exact=true 表示来自 AX 原文，按完全一致比较；false 表示来自截图识别
 struct Title { let text: String; let exact: Bool }
 
@@ -790,8 +824,8 @@ final class Session {
               let m = d.range(of: #"\d+(?=条新消息)"#, options: .regularExpression) else { return 0 }
         return Int(d[m]) ?? 0
     }
-    /// 在会话列表上滚动（正数向上，单位：点）；列表不支持用 AX 滚动，只能发滚轮事件
-    func scrollChatList(_ list: AXUIElement, _ dy: Int32) {
+    /// 在列表上滚动（正数向上，单位：点）；微信的列表不支持用 AX 滚动，只能发滚轮事件
+    func scrollList(_ list: AXUIElement, _ dy: Int32) {
         guard let f = axFrame(list) else { return }
         moveMouse(CGPoint(x: f.midX, y: f.midY)); usleep(30_000)
         CGEvent(scrollWheelEvent2Source: nil, units: .pixel, wheelCount: 1, wheel1: dy, wheel2: 0, wheel3: 0)?.post(tap: .cghidEventTap)
@@ -808,7 +842,7 @@ final class Session {
         }
         var last = top()
         for _ in 0..<80 {
-            scrollChatList(list, 2000)
+            scrollList(list, 2000)
             let now = top()
             if now == last { return }
             last = now
@@ -843,10 +877,132 @@ final class Session {
             if sum >= total && found.count == Set(allow).count { break }
             if fresh == 0 || seen.count >= 200 { break }   // 到底了
             try guardFront()
-            scrollChatList(list, -Int32(box.height * 0.8))
+            scrollList(list, -Int32(box.height * 0.8))
         }
         scrollChatListToTop(list)
         return (total, out, seen.count)
+    }
+
+    // MARK: 读取进度（每个聊天一个文件，记最后 3 条消息）
+
+    func cursorPath(_ chat: String) -> String {
+        let h = SHA256.hash(data: Data(chat.utf8)).map { String(format: "%02x", $0) }.joined()
+        return CACHE + "/cursor/" + account + "/" + h.prefix(32) + ".json"
+    }
+    func loadCursor(_ chat: String) -> [String]? {
+        guard let d = FileManager.default.contents(atPath: cursorPath(chat)),
+              let o = try? JSONSerialization.jsonObject(with: d) as? [String: Any] else { return nil }
+        return o["anchor"] as? [String]
+    }
+    func saveCursor(_ chat: String, _ all: [Msg]) {
+        let anchor = all.filter { $0.type == "message" }.suffix(3).map { $0.text }
+        guard !anchor.isEmpty else { return }
+        let p = cursorPath(chat)
+        try? FileManager.default.createDirectory(atPath: (p as NSString).deletingLastPathComponent, withIntermediateDirectories: true)
+        let o: [String: Any] = ["chat": chat, "anchor": anchor, "updated": tsFmt.string(from: Date())]
+        if let d = try? JSONSerialization.data(withJSONObject: o) { FileManager.default.createFile(atPath: p, contents: d) }
+    }
+
+    // MARK: 打开会话列表里的某一行并读消息
+
+    func axMessageList() -> AXUIElement? { axChatPane().flatMap { p in axChildren(p).first { axRole($0) == "AXList" } } }
+
+    /// 当前屏幕上能看到的消息（按从上到下排序）
+    func visibleMessages(_ list: AXUIElement) -> [Msg] {
+        guard let box = axFrame(list) else { return [] }
+        return axChildren(list).compactMap { e -> (CGFloat, Msg)? in
+            guard var t = axStr(e, kAXTitleAttribute), !t.isEmpty, let f = axFrame(e), f.height > 0, f.intersects(box) else { return nil }
+            if t.hasSuffix(" ") { t.removeLast() }
+            let isTime = f.height < 50 && t.range(of: MSG_TIME, options: .regularExpression) != nil
+            return (f.minY, Msg(type: isTime ? "time" : "message", text: t))
+        }.sorted { $0.0 < $1.0 }.map { $0.1 }
+    }
+
+    /// 在会话列表里找到这一行并点开（点击前核对该位置确实是这一行，点开后核对标题）
+    func openRow(_ r: ChatRow, _ allow: [String]) throws {
+        guard let list = axChatList(), let box = axFrame(list) else { throw fail(5, "NO_AX", "AX 读不到会话列表") }
+        scrollChatListToTop(list)
+        for _ in 0..<40 {
+            for e in axChildren(list) {
+                guard let raw = axStr(e, kAXTitleAttribute), let f = axFrame(e), box.contains(f),
+                      parseChatRow(raw, allow: allow)?.name == r.name else { continue }
+                let pt = CGPoint(x: f.midX, y: f.midY)
+                var hit: AXUIElement?
+                AXUIElementCopyElementAtPosition(AXUIElementCreateSystemWide(), Float(pt.x), Float(pt.y), &hit)
+                guard hit.flatMap({ axStr($0, kAXTitleAttribute) }) == raw else { continue }
+                try guardFront()
+                click(pt)
+                if waitUntil(TIMEOUT, 0.1, { axTitle().map { sameName($0, r.name) } ?? false }) { return }
+                throw fail(4, "TITLE_MISMATCH", "点开「\(r.name)」后标题是「\(axTitle() ?? "（无）")」，已停止")
+            }
+            let before = axChildren(list).compactMap { axStr($0, kAXTitleAttribute) }
+            scrollList(list, -Int32(box.height * 0.8))
+            if axChildren(list).compactMap({ axStr($0, kAXTitleAttribute) }) == before { break }
+        }
+        throw fail(2, "NOT_FOUND", "会话列表里找不到「\(r.name)」")
+    }
+
+    /// 读这个聊天的新消息：有读取进度就读到定位点为止，没有就读最近 unread 条；最多 maxMsgs 条
+    func readNew(_ r: ChatRow, _ maxMsgs: Int) throws -> (msgs: [Msg], note: String?) {
+        guard let list = axMessageList(), let box = axFrame(list) else { throw fail(5, "NO_AX", "AX 读不到聊天记录") }
+        _ = waitUntil(1, 0.1) { !visibleMessages(list).isEmpty }
+        let anchor = loadCursor(r.name) ?? []
+        var all = visibleMessages(list)
+        func count(_ m: [Msg]) -> Int { m.filter { $0.type == "message" }.count }
+        var result: [Msg]? = nil, note: String? = nil
+        for _ in 0..<15 {
+            if let n = afterAnchor(all, anchor) { result = n; break }
+            if anchor.isEmpty && count(all) > r.unread { break }
+            if count(all) >= maxMsgs { break }
+            try guardFront()
+            scrollList(list, Int32(box.height * 0.7))
+            guard let merged = prependPage(all, visibleMessages(list)), merged.count > all.count else { break }   // 到顶了
+            all = merged
+        }
+        if result == nil {
+            if !anchor.isEmpty { note = "没找到上次读到的位置，可能有更早的新消息没读到" }
+            // 从最后往前数够 unread 条消息（中间的时间行一起带上）
+            let want = anchor.isEmpty ? min(r.unread, maxMsgs) : maxMsgs
+            var n = 0, start = all.count
+            for i in stride(from: all.count - 1, through: 0, by: -1) {
+                if all[i].type == "message" { n += 1 }
+                start = i
+                if n >= want { break }
+            }
+            result = Array(all[start...])
+        }
+        saveCursor(r.name, all)
+        return (Array(result!.suffix(maxMsgs * 2)), note)
+    }
+
+    /// 读所有要读的未读聊天；读完切回原来打开的聊天
+    func printUnreadDetails(_ allow: [String], _ maxChats: Int, _ maxMsgs: Int) throws {
+        let original = axTitle().map { stripCount($0) }
+        let (total, rows, scanned) = try scanUnread(allow)
+        var chats: [[String: Any]] = [], skipped: [String] = []
+        for r in rows.prefix(maxChats) {
+            if let a = loadCursor(r.name), let last = a.last, previewIs(r.preview, last) { skipped.append(r.name); continue }
+            var item: [String: Any] = ["name": r.name, "unread": r.unread, "pinned": r.pinned, "muted": r.muted, "time": r.time]
+            do {
+                try openRow(r, allow)
+                let (msgs, note) = try readNew(r, maxMsgs)
+                item["messages"] = msgs.map { ["type": $0.type, "text": $0.text] }
+                item["new"] = msgs.filter { $0.type == "message" }.count
+                if let n = note { item["note"] = n }
+            } catch let e as WXError {
+                if e.code == 6 { throw e }
+                item["error"] = e.msg
+            }
+            chats.append(item)
+        }
+        var notes: [String] = []
+        if rows.count > maxChats { notes.append("未读聊天有 \(rows.count) 个，只读了前 \(maxChats) 个") }
+        if let o = original, !o.isEmpty {
+            do { var n: [String] = []; try openChat(o, &n) } catch { notes.append("没能切回原来的聊天「\(o)」") }
+        }
+        let out: [String: Any] = ["total": total, "scanned": scanned, "chats": chats, "skipped_no_new": skipped, "notes": notes]
+        let data = try JSONSerialization.data(withJSONObject: out, options: [.sortedKeys])
+        say(String(data: data, encoding: .utf8)!)
     }
 
     func printUnreadList(_ allow: [String]) throws {
@@ -1191,9 +1347,15 @@ func run(_ args: [String]) -> Int32 {
                 .map { $0.trimmingCharacters(in: .whitespaces) }.filter { !$0.isEmpty }
             let lockFd = try acquireLock()
             defer { close(lockFd) }
+            let clip = ClipboardBackup()   // 切回原聊天时会用搜索粘贴
+            clipBackup = clip
             let mouse = CGEvent(source: nil)?.location
-            defer { if let m = mouse { moveMouse(m) } }
-            try session.printUnreadList(allow)
+            defer {
+                clip.restore()
+                if let m = mouse { moveMouse(m) }
+            }
+            if args.count > 3 && args[3] == "list" { try session.printUnreadList(allow) }
+            else { try session.printUnreadDetails(allow, Int(envD("WX_UNREAD_MAX_CHATS", 20)), Int(envD("WX_UNREAD_MAX_MSGS", 50))) }
             return 0
         }
         if mode == "read" {
@@ -1304,7 +1466,7 @@ case "$1" in
   --dump)  exec "$BIN" dump "$NAME" "$APP" ;;
   --batch) [[ $# -eq 2 ]] || usage; exec "$BIN" batch "$NAME" "$APP" "$2" ;;
   --read)  [[ $# -ge 2 && $# -le 3 ]] || usage; exec "$BIN" read "$NAME" "$APP" "$2" "${3:-20}" ;;
-  --unread) exec "$BIN" unread "$NAME" "$APP" ;;
+  --unread) exec "$BIN" unread "$NAME" "$APP" "$([[ "${2:-}" == "--list-only" ]] && echo list || echo details)" ;;
   -*)      usage ;;
   *)       [[ $# -eq 2 ]] || usage; exec "$BIN" send "$NAME" "$APP" "$1" "$2" ;;
 esac
