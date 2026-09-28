@@ -38,11 +38,14 @@ Retina 缩放与截图缩放比例 agent 都无需关心。
 import hmac
 import json
 import os
+import re
 import subprocess
 import sys
 import tempfile
 import threading
+import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from typing import Optional, Tuple
 from urllib.parse import urlparse
 
 __version__ = "0.2.0"
@@ -59,12 +62,23 @@ TARGET_W = int(os.environ.get("TARGET_W", "1280"))
 QUALITY = os.environ.get("JPEG_QUALITY", "60")
 WX_SEND = os.path.expanduser(os.environ.get(
     "WX_SEND", os.path.join(os.path.dirname(os.path.abspath(__file__)), "wechat", "wx-send.sh")))
+OUTBOX = os.path.join(os.path.dirname(os.path.abspath(__file__)), "outbox")
+IMAGE_MAX = int(float(os.environ.get("WX_IMAGE_MAX_MB", "20")) * 1024 * 1024)
+IMAGE_EXTS = ("jpg", "jpeg", "png", "gif", "heic")
+IMAGE_NAME = re.compile(r"^[A-Za-z0-9_\u4e00-\u9fff-][A-Za-z0-9._\u4e00-\u9fff-]*$")
 
 pyautogui.FAILSAFE = True  # 把鼠标甩到屏幕左上角可紧急中断 agent 的操作
 pyautogui.PAUSE = 0.05
 
 lock = threading.Lock()
 state = {"img_w": None, "img_h": None}
+
+
+def sips_size(path) -> Tuple[int, int]:
+    """用 sips 读图片的像素宽高。"""
+    info = subprocess.run(["sips", "-g", "pixelWidth", "-g", "pixelHeight", path],
+                          check=True, capture_output=True, text=True).stdout
+    return int(info.split("pixelWidth:")[1].split()[0]), int(info.split("pixelHeight:")[1].split()[0])
 
 
 def take_screenshot():
@@ -82,12 +96,7 @@ def take_screenshot():
              "-s", "formatOptions", QUALITY, raw, "--out", out],
             check=True, stdout=subprocess.DEVNULL,
         )
-        info = subprocess.run(
-            ["sips", "-g", "pixelWidth", "-g", "pixelHeight", out],
-            check=True, capture_output=True, text=True,
-        ).stdout
-        w = int(info.split("pixelWidth:")[1].split()[0])
-        h = int(info.split("pixelHeight:")[1].split()[0])
+        w, h = sips_size(out)
         with open(out, "rb") as f:
             data = f.read()
         state["img_w"], state["img_h"] = w, h
@@ -146,6 +155,69 @@ def a_key(p):
     if isinstance(keys, str):
         keys = [keys]
     pyautogui.hotkey(*keys)
+
+
+def image_kind(data) -> Optional[str]:
+    """按文件头判断图片格式，认不出返回 None。"""
+    if data[:3] == b"\xff\xd8\xff":
+        return "jpg"
+    if data[:4] == b"\x89PNG":
+        return "png"
+    if data[:4] == b"GIF8":
+        return "gif"
+    if data[4:8] == b"ftyp" and data[8:12] in (b"heic", b"heix", b"mif1"):
+        return "heic"
+    return None
+
+
+def clean_stem(name) -> str:
+    """取文件名主干，不允许的字符换成 _，去掉开头的点。"""
+    stem = os.path.splitext(os.path.basename(name or ""))[0]
+    stem = re.sub(r"[^A-Za-z0-9._\u4e00-\u9fff-]", "_", stem)
+    return re.sub(r"\.{2,}", ".", stem).lstrip(".")[:60]
+
+
+def outbox_path(file) -> str:
+    """outbox 里的文件名 → 绝对路径；不合规或解析后跑出 outbox 就报错。"""
+    if not isinstance(file, str) or not IMAGE_NAME.match(file) or ".." in file \
+            or "." not in file or file.rsplit(".", 1)[1].lower() not in IMAGE_EXTS:
+        raise ValueError(f"文件名不合规：{file!r}（只能是 outbox 里的 jpg/png/gif/heic 文件名）")
+    root = os.path.realpath(OUTBOX)
+    path = os.path.realpath(os.path.join(root, file))
+    if os.path.dirname(path) != root:
+        raise ValueError(f"文件名不合规：{file!r}（指向了 outbox 外面）")
+    return path
+
+
+def save_image(data, name=None) -> str:
+    """图片存进 outbox，返回最终文件名；扩展名以内容为准，HEIC 转成 JPEG，重名加 -1、-2。"""
+    kind = image_kind(data)
+    if kind is None:
+        raise ValueError("不是 JPEG / PNG / GIF / HEIC 图片")
+    stem = clean_stem(name) or time.strftime("img-%Y%m%d-%H%M%S")
+    ext = "jpg" if kind == "heic" else kind
+    os.makedirs(OUTBOX, exist_ok=True)
+    file, n = f"{stem}.{ext}", 0
+    while os.path.lexists(os.path.join(OUTBOX, file)):
+        n += 1
+        file = f"{stem}-{n}.{ext}"
+    path = outbox_path(file)
+    if kind == "heic":
+        with tempfile.NamedTemporaryFile(suffix=".heic") as tmp:
+            tmp.write(data)
+            tmp.flush()
+            subprocess.run(["sips", "-s", "format", "jpeg", tmp.name, "--out", path],
+                           check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    else:
+        with open(path, "xb") as f:
+            f.write(data)
+    return file
+
+
+def image_info(file) -> dict:
+    path = outbox_path(file)
+    w, h = sips_size(path)
+    return {"file": file, "width": w, "height": h, "bytes": os.path.getsize(path)}
 
 
 # wx-send.sh 的退出码
