@@ -37,6 +37,8 @@
 #   WX_INPUT_H=118      输入框文字区高度（不含上方工具栏）
 #   WX_TOOLBAR_H=40     输入框上方工具栏高度
 #   WX_LOG=路径          日志位置，默认 ~/Library/Logs/wx-send.log
+#   WX_IMAGES=1         --read / --unread 时顺便取图片（右键「复制」），存到仓库的 inbox/
+#   WX_MAX_IMAGES=10    每次最多取几张
 #
 # 退出码：0 成功 · 2 没搜到 · 3 同名 · 4 标题/输入校验失败 · 5 环境或窗口问题
 #        6 焦点被切走 · 7 输入框有草稿 · 8 发送失败 · 9 超出每日上限 · 10 无法确认是否发出（不要直接重试）
@@ -167,6 +169,13 @@ let DAILY_MAX = Int(envD("WX_DAILY_MAX", 500))
 let CONFIRM = env["WX_NO_CONFIRM"] != "1"
 let SENDERS = env["WX_UNREAD_SENDERS"] != "0"   // 读未读时点头像识别发送人
 let REMARK = env["WX_UNREAD_REMARK"] != "0"     // 读完把点开过的聊天标回未读
+let IMAGES = env["WX_IMAGES"] == "1"               // 读消息时顺便取图
+let MAX_IMAGES = Int(envD("WX_MAX_IMAGES", 10))
+let IMAGE_WAIT = envD("WX_IMAGE_WAIT", 3)          // 点「复制」后等剪贴板出现图片的秒数
+let INBOX = env["WX_INBOX"] ?? ""
+let IMAGE_DEBUG = env["WX_IMAGE_DEBUG"] == "1"     // 第 0 步实测用，定下来后删掉
+let COPY_TITLES: Set<String> = ["复制", "Copy"]    // 图片右键菜单里的「复制」（实测后改成准确值）
+let IMG_DX = CGFloat(envD("WX_IMG_DX", 110))       // 没有 AXImage 子元素时，气泡中心离这一行左右边缘的距离（实测后定）
 let TITLE_MINX = CGFloat(envD("WX_TITLE_MINX", 270))
 let TITLE_H = CGFloat(envD("WX_TITLE_H", 80))
 let LIST_W = CGFloat(envD("WX_LIST_W", 420))
@@ -546,6 +555,33 @@ func axFind(_ e: AXUIElement, _ depth: Int = 0, _ match: (AXUIElement) -> Bool) 
     for c in axChildren(e) { if let f = axFind(c, depth + 1, match) { return f } }
     return nil
 }
+/// e 是不是 ancestor 本身或它的后代（往上找 6 层）
+func isInside(_ e: AXUIElement, _ ancestor: AXUIElement) -> Bool {
+    var cur: AXUIElement? = e
+    for _ in 0..<6 {
+        guard let c = cur else { return false }
+        if CFEqual(c, ancestor) { return true }
+        cur = axParent(c)
+    }
+    return false
+}
+
+/// 剪贴板里的图片：优先原文件（文件 URL），其次 PNG / JPEG / GIF，最后 TIFF 转 PNG；返回 (数据, 扩展名)
+func imageFromPasteboard(_ pb: NSPasteboard) -> (Data, String)? {
+    if let url = (pb.readObjects(forClasses: [NSURL.self], options: [.urlReadingFileURLsOnly: true]) as? [URL])?.first,
+       let ext = ["png", "jpg", "jpeg", "gif"].first(where: { $0 == url.pathExtension.lowercased() }),
+       let d = try? Data(contentsOf: url) {
+        return (d, ext == "jpeg" ? "jpg" : ext)
+    }
+    let types: [(NSPasteboard.PasteboardType, String)] = [
+        (.png, "png"), (NSPasteboard.PasteboardType("public.jpeg"), "jpg"), (NSPasteboard.PasteboardType("com.compuserve.gif"), "gif")]
+    for (t, ext) in types { if let d = pb.data(forType: t) { return (d, ext) } }
+    if let d = pb.data(forType: .tiff), let rep = NSBitmapImageRep(data: d),
+       let png = rep.representation(using: .png, properties: [:]) {
+        return (png, "png")
+    }
+    return nil
+}
 /// 两个名字是否完全一样（只忽略首尾空格和群名后的人数）
 func sameName(_ a: String, _ b: String) -> Bool {
     let x = stripCount(a.trimmingCharacters(in: .whitespaces)), y = stripCount(b.trimmingCharacters(in: .whitespaces))
@@ -604,7 +640,18 @@ func parseChatRow(_ raw: String, allow: [String]) -> ChatRow? {
 struct Msg: Equatable {
     var type: String; var text: String
     var from: String? = nil, sender: String? = nil, wxid: String? = nil
+    var image: String? = nil, imageError: String? = nil
     var plain: Msg { Msg(type: type, text: text) }   // 拼接和对应时只比类型和内容
+
+    var dict: [String: String] {
+        var d = ["type": type, "text": text]
+        if let v = from { d["from"] = v }
+        if let v = sender, !v.isEmpty { d["sender"] = v }
+        if let v = wxid, !v.isEmpty { d["wxid"] = v }
+        if let v = image { d["image"] = v }
+        if let v = imageError { d["image_error"] = v }
+        return d
+    }
 }
 
 let MSG_TIME = #"^(\d{1,2}:\d{2}|昨天.*|前天.*|星期.*|周.*|\d{1,2}月\d{1,2}日.*|\d{4}年.*|\d{1,2}/\d{1,2}.*)$"#
@@ -1060,16 +1107,18 @@ final class Session {
         }
     }
 
-    /// 屏幕上能看到的消息行（按从上到下），带位置
-    func visibleRows(_ list: AXUIElement) -> [(msg: Msg, frame: CGRect, raw: String)] {
+    typealias Row = (msg: Msg, frame: CGRect, raw: String, el: AXUIElement)
+
+    /// 屏幕上能看到的消息行（按从上到下），带位置和 AX 元素
+    func visibleRows(_ list: AXUIElement) -> [Row] {
         guard let box = axFrame(list) else { return [] }
-        return axChildren(list).compactMap { e -> (Msg, CGRect, String)? in
+        return axChildren(list).compactMap { e -> Row? in
             guard let raw = axStr(e, kAXTitleAttribute), !raw.isEmpty, let f = axFrame(e), f.height > 0, f.intersects(box) else { return nil }
             var t = raw
             if t.hasSuffix(" ") { t.removeLast() }
             let isTime = f.height < 50 && t.range(of: MSG_TIME, options: .regularExpression) != nil
-            return (Msg(type: isTime ? "time" : "message", text: t), f, raw)
-        }.sorted { $0.1.minY < $1.1.minY }
+            return (Msg(type: isTime ? "time" : "message", text: t), f, raw, e)
+        }.sorted { $0.frame.minY < $1.frame.minY }
     }
 
     func scrollListToBottom(_ list: AXUIElement) {
@@ -1111,8 +1160,8 @@ final class Session {
         return (name, wxid)
     }
 
-    /// 给 all[start...] 里的消息识别发送人：滚到底，一页页往上，把屏幕上的行对应回记录，点头像
-    func identifySenders(_ list: AXUIElement, _ all: inout [Msg], _ start: Int) throws {
+    /// 滚到底，一页页往上，把屏幕上的行对应回 all 里的下标，对下标 >= start 的行调用 act
+    func walkRows(_ list: AXUIElement, _ all: inout [Msg], _ start: Int, _ act: (Int, Row, inout [Msg]) throws -> Void) throws {
         guard start < all.count, let box = axFrame(list) else { return }
         scrollListToBottom(list)
         var hi = all.count
@@ -1121,23 +1170,128 @@ final class Session {
             let page = rows.map { $0.msg.plain }
             guard !page.isEmpty, let j = stride(from: min(hi, all.count) - page.count, through: 0, by: -1)
                     .first(where: { j in j >= 0 && all[j..<(j + page.count)].map { $0.plain } == page }) else { return }
-            for (k, row) in rows.enumerated().reversed() {
-                let i = j + k
-                guard i >= start, all[i].type == "message", all[i].from == nil else { continue }
-                let f = row.frame
-                if let c = try probeAvatar(CGPoint(x: f.minX + 38, y: f.minY + 28), row.raw, box) {
-                    all[i].from = "other"; all[i].sender = c.name; all[i].wxid = c.wxid
-                } else if let c = try probeAvatar(CGPoint(x: f.maxX - 38, y: f.minY + 28), row.raw, box) {
-                    all[i].from = "me"; all[i].sender = c.name; all[i].wxid = c.wxid
-                } else if box.contains(CGPoint(x: f.minX + 38, y: f.minY + 28)) {
-                    all[i].from = "system"
-                }
+            for (k, row) in rows.enumerated().reversed() where j + k >= start {
+                try act(j + k, row, &all)
             }
             if j <= start { return }
             hi = j + page.count - 1
             try guardFront()
             scrollList(list, Int32(box.height * 0.6))
         }
+    }
+
+    /// 点这一行的头像识别发送人
+    func identifySender(_ i: Int, _ row: Row, _ msgs: inout [Msg], _ box: CGRect) throws {
+        guard msgs[i].type == "message", msgs[i].from == nil else { return }
+        let f = row.frame
+        if let c = try probeAvatar(CGPoint(x: f.minX + 38, y: f.minY + 28), row.raw, box) {
+            msgs[i].from = "other"; msgs[i].sender = c.name; msgs[i].wxid = c.wxid
+        } else if let c = try probeAvatar(CGPoint(x: f.maxX - 38, y: f.minY + 28), row.raw, box) {
+            msgs[i].from = "me"; msgs[i].sender = c.name; msgs[i].wxid = c.wxid
+        } else if box.contains(CGPoint(x: f.minX + 38, y: f.minY + 28)) {
+            msgs[i].from = "system"
+        }
+    }
+
+    var imagesTaken = 0, imagesSkipped = 0
+
+    /// 这一行是图片就复制出来存进 inbox；超过张数上限的只计数
+    func takeImage(_ i: Int, _ row: Row, _ msgs: inout [Msg]) throws {
+        guard msgs[i].type == "message", msgs[i].text == "图片", msgs[i].image == nil, msgs[i].imageError == nil else { return }
+        if imagesTaken >= MAX_IMAGES { imagesSkipped += 1; return }
+        imagesTaken += 1
+        do { msgs[i].image = try copyImage(row, side: msgs[i].from) }
+        catch let e as WXError where e.code == 5 || e.code == 6 { throw e }
+        catch let e as WXError { msgs[i].imageError = e.msg }
+    }
+
+    /// 右键这张图 →「复制」→ 存进 inbox，返回文件名
+    func copyImage(_ row: Row, side: String?) throws -> String {
+        if INBOX.isEmpty { throw fail(4, "NO_INBOX", "没有设置 WX_INBOX") }
+        if IMAGE_DEBUG { debugRow(row) }
+        let f = row.frame
+        let points: [CGPoint]
+        if let img = axFind(row.el, 0, { axRole($0) == "AXImage" }), let r = axFrame(img), r.width > 4 {
+            points = [CGPoint(x: r.midX, y: r.midY)]
+        } else {
+            let left = CGPoint(x: f.minX + IMG_DX, y: f.midY), right = CGPoint(x: f.maxX - IMG_DX, y: f.midY)
+            points = side == "me" ? [right] : side == "other" ? [left] : [left, right]
+        }
+        for pt in points {
+            if let name = try copyAt(pt, row) { return name }
+        }
+        throw fail(4, "NO_COPY", "右键菜单里没有「复制」")
+    }
+
+    /// 在 pt 右键并点「复制」，等剪贴板出现图片后存进 inbox；这个位置不在这一行上、或菜单里没有「复制」时返回 nil
+    func copyAt(_ pt: CGPoint, _ row: Row) throws -> String? {
+        var hit: AXUIElement?
+        AXUIElementCopyElementAtPosition(AXUIElementCreateSystemWide(), Float(pt.x), Float(pt.y), &hit)
+        guard let h = hit, isInside(h, row.el) else { return nil }
+        try guardFront()
+        let pb = NSPasteboard.general
+        let before = pb.changeCount
+        for t: CGEventType in [.mouseMoved, .rightMouseDown, .rightMouseUp] {
+            CGEvent(mouseEventSource: nil, mouseType: t, mouseCursorPosition: pt, mouseButton: .right)?.post(tap: .cghidEventTap)
+            usleep(t == .mouseMoved ? 25_000 : 35_000)
+        }
+        var item: AXUIElement?
+        _ = waitUntil(1, 0.05) {
+            item = contextMenuItems().first { COPY_TITLES.contains(axStr($0, kAXTitleAttribute) ?? "") }
+            return item != nil
+        }
+        if IMAGE_DEBUG { eprint("菜单：" + contextMenuItems().compactMap { axStr($0, kAXTitleAttribute) }.joined(separator: " | ")) }
+        guard let it = item, let r = axFrame(it) else { try closeMenu(); return nil }
+        let p = CGPoint(x: r.midX, y: r.midY)
+        var onItem: AXUIElement?
+        AXUIElementCopyElementAtPosition(AXUIElementCreateSystemWide(), Float(p.x), Float(p.y), &onItem)
+        guard let o = onItem, axRole(o) == "AXMenuItem", COPY_TITLES.contains(axStr(o, kAXTitleAttribute) ?? "") else {
+            try closeMenu(); return nil
+        }
+        click(p)
+        try closeMenu()   // 点击后菜单通常已经关了，这里兜底
+        var got: (Data, String)?
+        _ = waitUntil(IMAGE_WAIT, 0.1) {
+            guard pb.changeCount != before else { return false }
+            got = imageFromPasteboard(pb)
+            return got != nil
+        }
+        if IMAGE_DEBUG { eprint("剪贴板类型：" + (pb.types ?? []).map { $0.rawValue }.joined(separator: ", ")) }
+        guard let (data, ext) = got else { throw fail(4, "NO_IMAGE", "点了「复制」，但 \(Int(IMAGE_WAIT)) 秒内剪贴板里没有图片") }
+        return try saveInbox(data, ext)
+    }
+
+    /// 关掉还开着的右键菜单；连按 3 次 Esc 还关不掉就停止，防止后面误点
+    func closeMenu() throws {
+        for _ in 0..<3 where !contextMenuItems().isEmpty {
+            key(K_ESC)
+            _ = waitUntil(0.5, 0.05) { contextMenuItems().isEmpty }
+        }
+        if !contextMenuItems().isEmpty { throw fail(5, "MENU_OPEN", "右键菜单关不掉，为防误点已停止") }
+    }
+
+    /// 存进 inbox，文件名 in-时间-序号.扩展名
+    func saveInbox(_ data: Data, _ ext: String) throws -> String {
+        try? FileManager.default.createDirectory(atPath: INBOX, withIntermediateDirectories: true)
+        let fmt = DateFormatter()
+        fmt.locale = Locale(identifier: "en_US_POSIX")
+        fmt.dateFormat = "yyyyMMdd-HHmmss"
+        let stamp = fmt.string(from: Date())
+        var n = 1, name = ""
+        repeat { name = "in-\(stamp)-\(n).\(ext)"; n += 1 } while FileManager.default.fileExists(atPath: INBOX + "/" + name)
+        do { try data.write(to: URL(fileURLWithPath: INBOX + "/" + name)) }
+        catch { throw fail(4, "INBOX_WRITE", "图片存不进 \(INBOX)：\(error.localizedDescription)") }
+        return name
+    }
+
+    /// 第 0 步实测用：打印这一行的 AX 子树
+    func debugRow(_ row: Row) {
+        func walk(_ e: AXUIElement, _ d: Int) {
+            let f = axFrame(e).map { "x=\(Int($0.minX)) y=\(Int($0.minY)) w=\(Int($0.width)) h=\(Int($0.height))" } ?? "-"
+            eprint(String(repeating: "  ", count: d) + "\(axRole(e)) 「\(axStr(e, kAXTitleAttribute) ?? "")」 \(f)")
+            if d < 4 { axChildren(e).forEach { walk($0, d + 1) } }
+        }
+        walk(row.el, 0)
     }
 
     /// 读这个聊天的新消息：有读取进度就读到定位点为止，没有就读最近 unread 条；最多 maxMsgs 条
@@ -1171,16 +1325,23 @@ final class Session {
         }
         saveCursor(r.name, all)
         let final = Array(result!.suffix(maxMsgs * 2))
-        if SENDERS && group {   // 私聊的发送人就是这个聊天本身，不用点头像
-            do { try identifySenders(list, &all, all.count - final.count) }
-            catch let e as WXError where e.code == 6 { throw e }
-            catch let e as WXError { return (Array(all.suffix(final.count)), (note.map { $0 + "；" } ?? "") + "识别发送人中断：" + e.msg) }
+        let senders = SENDERS && group   // 私聊的发送人就是这个聊天本身，不用点头像
+        if senders || IMAGES {
+            do {
+                try walkRows(list, &all, all.count - final.count) { i, row, msgs in
+                    if senders { try identifySender(i, row, &msgs, box) }
+                    if IMAGES { try takeImage(i, row, &msgs) }
+                }
+            }
+            catch let e as WXError where e.code == 6 || e.tag == "MENU_OPEN" { throw e }
+            catch let e as WXError { return (Array(all.suffix(final.count)), (note.map { $0 + "；" } ?? "") + "逐条处理中断：" + e.msg) }
         }
         return (Array(all.suffix(final.count)), note)
     }
 
     /// 读所有要读的未读聊天；读完切回原来打开的聊天
     func printUnreadDetails(_ allow: [String], _ maxChats: Int, _ maxMsgs: Int) throws {
+        imagesTaken = 0; imagesSkipped = 0
         // 先切到前台，AX 树才有内容，才能记下原来打开的聊天
         try activate()
         W = try ensureWindow()
@@ -1196,13 +1357,7 @@ final class Session {
                 let group = isGroupChat()
                 item["group"] = group
                 let (msgs, note) = try readNew(r, maxMsgs, group: group)
-                item["messages"] = msgs.map { m -> [String: String] in
-                    var d = ["type": m.type, "text": m.text]
-                    if let v = m.from { d["from"] = v }
-                    if let v = m.sender, !v.isEmpty { d["sender"] = v }
-                    if let v = m.wxid, !v.isEmpty { d["wxid"] = v }
-                    return d
-                }
+                item["messages"] = msgs.map { $0.dict }
                 item["new"] = msgs.filter { $0.type == "message" }.count
                 if let n = note { item["note"] = n }
             } catch let e as WXError {
@@ -1213,6 +1368,7 @@ final class Session {
         }
         var notes: [String] = []
         if rows.count > maxChats { notes.append("未读聊天有 \(rows.count) 个，只读了前 \(maxChats) 个") }
+        if imagesSkipped > 0 { notes.append("图片超过 \(MAX_IMAGES) 张，有 \(imagesSkipped) 张没取（WX_MAX_IMAGES）") }
         let opened = chats.filter { $0["messages"] != nil }.compactMap { $0["name"] as? String }
         // 切回原来的聊天；原来没打开聊天的话，切到一个本来就没有未读的聊天，这样读过的聊天都能标回未读
         var back = false
@@ -1502,24 +1658,28 @@ final class Session {
         }
     }
 
-    /// 读取聊天记录里当前加载出来的消息（最多 limit 条），JSON 输出
+    /// 读取聊天记录里当前加载出来的消息（最多 limit 条），JSON 输出；WX_IMAGES=1 时顺便取图
     func readChat(_ contact: String, _ limit: Int) throws {
         var notes: [String] = []
         try openChat(contact, &notes)
-        guard let list = axChatPane().flatMap({ p in axChildren(p).first { axRole($0) == "AXList" } }) else {
-            throw fail(5, "NO_AX", "AX 读不到聊天记录")
-        }
-        let time = #"^(\d{1,2}:\d{2}|昨天.*|前天.*|星期.*|周.*|\d{1,2}月\d{1,2}日.*|\d{4}年.*|\d{1,2}/\d{1,2}.*)$"#
-        var items: [[String: String]] = []
+        guard let list = axMessageList() else { throw fail(5, "NO_AX", "AX 读不到聊天记录") }
+        var items: [Msg] = []
         for row in axChildren(list) {
             // 屏幕外的消息是没有内容的占位元素，读不到
             guard var t = axStr(row, kAXTitleAttribute), !t.isEmpty else { continue }
             if t.hasSuffix(" ") { t.removeLast() }
             let h = axFrame(row)?.height ?? 0
-            let isTime = h < 50 && t.range(of: time, options: .regularExpression) != nil
-            items.append(["type": isTime ? "time" : "message", "text": t])
+            let isTime = h < 50 && t.range(of: MSG_TIME, options: .regularExpression) != nil
+            items.append(Msg(type: isTime ? "time" : "message", text: t))
         }
-        let out: [String: Any] = ["chat": contact, "items": Array(items.suffix(limit)), "notes": notes]
+        if IMAGES {
+            imagesTaken = 0; imagesSkipped = 0
+            do { try walkRows(list, &items, max(0, items.count - limit)) { i, row, msgs in try takeImage(i, row, &msgs) } }
+            catch let e as WXError where e.code == 6 || e.tag == "MENU_OPEN" { throw e }
+            catch let e as WXError { notes.append("取图中断：" + e.msg) }
+            if imagesSkipped > 0 { notes.append("图片超过 \(MAX_IMAGES) 张，有 \(imagesSkipped) 张没取（WX_MAX_IMAGES）") }
+        }
+        let out: [String: Any] = ["chat": contact, "items": items.suffix(limit).map { $0.dict }, "notes": notes]
         let data = try JSONSerialization.data(withJSONObject: out, options: [.sortedKeys])
         say(String(data: data, encoding: .utf8)!)
     }
@@ -1892,6 +2052,12 @@ case "$1" in
       prune "${WX_CURSOR_DAYS:-3}" >/dev/null
     fi ;;
 esac
+
+# ---------- 读图：图片存到仓库的 inbox/，每次读图前清掉 N 天前的 ----------
+export WX_INBOX="$(cd "$DIR/.." && pwd)/inbox"
+if [[ "${WX_IMAGES:-}" == "1" && -d "$WX_INBOX" ]]; then
+  find "$WX_INBOX" -type f -name 'in-*' -mmin +$(( ${WX_INBOX_DAYS:-3} * 1440 )) -delete
+fi
 
 build
 
