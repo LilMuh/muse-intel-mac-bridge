@@ -340,28 +340,17 @@ func pasteText(_ s: String) {
     key(K_V, cmd: true)
 }
 
-/// 把图片放进剪贴板并粘贴；WX_IMAGE_PASTE 只给第 0 步试验切换写法用
+/// 把图片以 NSImage 放进剪贴板并粘贴（实测和截图复制一样，微信当图片处理，不弹确认框）
 func pasteImage(_ path: String) {
     let pb = NSPasteboard.general
     pb.clearContents()
-    let url = URL(fileURLWithPath: path)
-    switch env["WX_IMAGE_PASTE"] ?? "image" {
-    case "url":
-        pb.writeObjects([url as NSURL])
-    case "data":
-        let types: [String: NSPasteboard.PasteboardType] = [
-            "png": .png, "gif": NSPasteboard.PasteboardType("com.compuserve.gif"),
-            "jpg": NSPasteboard.PasteboardType("public.jpeg"), "jpeg": NSPasteboard.PasteboardType("public.jpeg")]
-        if let t = types[url.pathExtension.lowercased()], let d = try? Data(contentsOf: url) { pb.setData(d, forType: t) }
-    default:
-        if let img = NSImage(contentsOf: url) { pb.writeObjects([img]) }
-    }
+    if let img = NSImage(contentsOf: URL(fileURLWithPath: path)) { pb.writeObjects([img]) }
     usleep(50_000)
     key(K_V, cmd: true)
 }
 
-/// 图片消息在聊天记录里的 AX 标题（第 0 步试验确认后改成实测值）
-let IMAGE_ROW_TITLES: Set<String> = ["图片", "[图片]"]
+/// 图片消息在聊天记录里的 AX 标题（实测）
+let IMAGE_ROW_TITLES: Set<String> = ["图片"]
 
 /// 要发的内容：一段文字，或一张图片（文件绝对路径）
 enum Outgoing {
