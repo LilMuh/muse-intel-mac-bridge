@@ -287,7 +287,7 @@ python3 mab.py wechat-thumb clip-xxx.png       # 下载缩略图（长边 512）
 **发送时会核对什么：** 和发文字一样，先核对聊天标题、确认输入框是空的；粘贴后确认输入框里是一张图片；发出后确认聊天记录里多了一条图片消息。读不到输入框时直接停止，不会不核对就发。图片消息目前**不检测**发送失败的红色感叹号，返回的 `output` 里会写「未检测发送失败标记」。
 
 **注意：**
-- 支持 JPG、PNG、GIF、HEIC（HEIC 会自动转成 JPG），单张最大 20 MB（`WX_IMAGE_MAX_MB`）。
+- 支持 JPG、PNG、GIF、HEIC（HEIC 会自动转成 JPG），单张最大约 50 MB（`WX_IMAGE_MAX_MB`，防止请求过大把 bridge 撑坏，不是微信的限制）。
 - GIF 动图可能只发出第一帧（粘贴时会转成静态图，还没有验证过）。
 - 文件名里的空格和特殊字符会换成 `_`，重名时自动加 `-1`、`-2`，以返回的 `file` 为准。
 - 发完不会自动删除，`outbox/` 需要自己清理。
@@ -343,7 +343,7 @@ python3 mab.py wechat-thumb clip-xxx.png       # 下载缩略图（长边 512）
 | `WX_MUTED_ALLOW` | 空 | 读未读时要读的免打扰群，用 `\|` 分隔 |
 | `WX_CURSOR_DAYS` | `3` | 读取记录保留几天 |
 | `WX_FRIEND_GREETING` | 空 | 通过好友申请后自动发的第一句话 |
-| `WX_IMAGE_MAX_MB` | `20` | 单张图片上限 |
+| `WX_IMAGE_MAX_MB` | `50` | 单张图片上限（按上传请求的大小粗略检查） |
 
 ## 安全须知
 

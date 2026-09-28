@@ -182,11 +182,10 @@ class HttpTest(ServerCase):
         status, _ = self.upload("a.jpg", b"%PDF-1.4 fake")
         self.assertEqual(status, 400)
 
-    def test_upload_over_decoded_limit(self):
-        server.IMAGE_MAX = 10
+    def test_upload_only_checks_request_size(self):
+        server.IMAGE_MAX = 10   # 请求上限约 64 KB，图片本身超过 10 字节也照收
         status, body = self.upload()
-        self.assertEqual(status, 400)
-        self.assertIn("太大", body["error"])
+        self.assertEqual((status, body["file"]), (200, "a.png"))
 
     def test_body_over_limit_is_413(self):
         server.IMAGE_MAX = 10

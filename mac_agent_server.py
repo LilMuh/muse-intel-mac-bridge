@@ -39,7 +39,7 @@ Retina 缩放与截图缩放比例 agent 都无需关心。
   WX_SEND       wx-send.sh 的路径，默认用仓库里的 wechat/wx-send.sh
   WX_ACCOUNTS   微信账号：别名=App 路径，多个用逗号分隔（只开一个微信可不填）
   WX_FRIEND_GREETING  通过好友申请后自动发的第一句话（不填就不发）
-  WX_IMAGE_MAX_MB  单张图片上限，默认 20
+  WX_IMAGE_MAX_MB  单张图片上限，默认 50（只在请求阶段按请求大小检查）
 """
 import base64
 import hmac
@@ -70,7 +70,7 @@ QUALITY = os.environ.get("JPEG_QUALITY", "60")
 WX_SEND = os.path.expanduser(os.environ.get(
     "WX_SEND", os.path.join(os.path.dirname(os.path.abspath(__file__)), "wechat", "wx-send.sh")))
 OUTBOX = os.path.join(os.path.dirname(os.path.abspath(__file__)), "outbox")
-IMAGE_MAX = int(float(os.environ.get("WX_IMAGE_MAX_MB", "20")) * 1024 * 1024)
+IMAGE_MAX = int(float(os.environ.get("WX_IMAGE_MAX_MB", "50")) * 1024 * 1024)   # 防止请求过大撑爆内存，不是微信的限制
 IMAGE_EXTS = ("jpg", "jpeg", "png", "gif", "heic")
 IMAGE_NAME = re.compile(r"^[A-Za-z0-9_\u4e00-\u9fff-][A-Za-z0-9._ \u4e00-\u9fff-]*$")   # 允许空格：Mac 截图的文件名带空格
 
@@ -321,8 +321,6 @@ def a_wechat_image_upload(p):
         data = base64.b64decode(text_arg(p, "data"), validate=True)
     except ValueError:   # 包括 binascii.Error 和非 ASCII 字符
         raise ValueError("data 不是合法的 base64")
-    if len(data) > IMAGE_MAX:
-        raise ValueError(f"图片太大，最大 {IMAGE_MAX // 1048576} MB（WX_IMAGE_MAX_MB）")
     return {"ok": True, **image_info(save_image(data, p.get("name")))}
 
 

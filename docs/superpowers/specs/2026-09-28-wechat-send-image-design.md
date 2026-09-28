@@ -80,7 +80,7 @@ mab.py wechat-send --image X
 3. 返回格式和发文字完全一样（`ok/code/status/dry_run/output`）。
 
 上传处理：
-- 先检查 `Content-Length`。超过 `WX_IMAGE_MAX_MB`（默认 20）换算后的 base64 长度，就直接返回 413，不读请求体。
+- 只检查一次 `Content-Length`：超过 `WX_IMAGE_MAX_MB`（默认 50）换算后的 base64 长度就返回 413。解码后不再检查大小。这个上限只是防止请求过大撑爆内存，不是微信的限制。
 - base64 解码后，按**文件头**判断格式（JPEG `FFD8FF`、PNG `89504E47`、GIF `GIF8`、HEIC `ftypheic/heix/mif1`）。文件内容和扩展名对不上时，以内容为准改正扩展名。
 - HEIC 用 `sips -s format jpeg` 转成 JPEG。
 - 宽高用 `sips -g pixelWidth -g pixelHeight` 读取。
