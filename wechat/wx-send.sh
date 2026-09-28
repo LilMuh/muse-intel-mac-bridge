@@ -705,6 +705,11 @@ func prependRows(_ all: [Msg], _ page: [Msg], known: [Bool]) -> [Msg]? {
     return Array(page.prefix(k)) + all
 }
 
+/// 会话列表这一行是否显示为未读：「N条未读」或免打扰群的「[N条]」，要是单独的一段，预览里恰好出现这几个字不算
+func showsUnread(_ raw: String) -> Bool {
+    raw.range(of: #"(^| )(\d+条未读|\[\d+条\])( |$)"#, options: .regularExpression) != nil
+}
+
 // MARK: - 对位结束
 
 /// 会话列表的预览是不是就是这条消息（群里的预览是「发送人: 内容」，图片是「[图片]」）
@@ -1131,7 +1136,7 @@ final class Session {
         return waitUntil(1, 0.1) {
             (axChatList().map { axChildren($0) } ?? []).contains {
                 let t = axStr($0, kAXTitleAttribute) ?? ""
-                return t.hasPrefix(name + " ") && t.contains("条未读")
+                return t.hasPrefix(name + " ") && showsUnread(t)
             }
         }
     }
@@ -1290,6 +1295,8 @@ final class Session {
         return try saveInbox(data, ext)
     }
 
+    func closeMenuQuietly() { for _ in 0..<3 where !contextMenuItems().isEmpty { key(K_ESC); usleep(200_000) } }
+
     /// 关掉还开着的右键菜单；连按 3 次 Esc 还关不掉就停止，防止后面误点
     func closeMenu() throws {
         for _ in 0..<3 where !contextMenuItems().isEmpty {
@@ -1363,6 +1370,35 @@ final class Session {
         return (Array(all.suffix(final.count)), note)
     }
 
+    // 读了谁就要未读谁：点开前记账，标回未读后才销账；账本跨进程保留，被打断时下次调用补标
+    var owedPath: String { CACHE + "/remark-" + account + ".json" }
+    func loadOwed() -> [String: Int] {
+        (try? Data(contentsOf: URL(fileURLWithPath: owedPath))).flatMap { try? JSONSerialization.jsonObject(with: $0) as? [String: Int] } ?? [:]
+    }
+    func saveOwed(_ owed: [String: Int]) {
+        if owed.isEmpty { try? FileManager.default.removeItem(atPath: owedPath); return }
+        if let d = try? JSONSerialization.data(withJSONObject: owed) { try? d.write(to: URL(fileURLWithPath: owedPath), options: .atomic) }
+    }
+
+    /// 标回未读，失败再试 2 次；微信被切走时不再重试
+    func remark(_ name: String) -> Bool {
+        for k in 0..<3 {
+            if (try? markUnread(name)) == true { return true }
+            if !isFront() { return false }
+            if k < 2 { usleep(400_000) }
+        }
+        return false
+    }
+
+    /// 把账上的聊天逐个标回未读（当前停在文件传输助手上）；返回标回了的名字
+    func payOwed(_ owed: inout [String: Int]) -> [String] {
+        var done: [String] = []
+        for name in owed.keys.sorted() {
+            if sameName(HOME_CHAT, name) || remark(name) { owed[name] = nil; done.append(name); saveOwed(owed) }
+        }
+        return done
+    }
+
     /// 读所有要读的未读聊天；读完切到文件传输助手
     func printUnreadDetails(_ allow: [String], _ maxChats: Int, _ maxMsgs: Int) throws {
         imagesTaken = 0; imagesSkipped = 0; cursorsToSave = []
@@ -1370,11 +1406,25 @@ final class Session {
         try activate()
         W = try ensureWindow()
         _ = waitUntil(1, 0.1) { axTitle() != nil }
+        var notes: [String] = []
+        // 上次被打断、没来得及标回未读的聊天，先补标，这样它们会重新出现在未读列表里
+        var owed = loadOwed()
+        let owedCounts = owed
+        if REMARK && !owed.isEmpty {
+            var n: [String] = []
+            if (try? openChat(HOME_CHAT, &n)) != nil {
+                let done = payOwed(&owed)
+                if !done.isEmpty { notes.append("补标了上次没标回未读的：" + done.joined(separator: "、")) }
+            }
+        }
         let (total, rows, scanned) = try scanUnread(allow)
         var chats: [[String: Any]] = [], skipped: [String] = []
-        for r in rows.prefix(maxChats) {
+        for var r in rows.prefix(maxChats) {
             if let a = loadCursor(r.name), let last = a.last, previewIs(r.preview, last) { skipped.append(r.name); continue }
+            // 标回未读后只显示「1条未读」，按账上记的原始条数读
+            r.unread = max(r.unread, owedCounts[r.name] ?? 0)
             var item: [String: Any] = ["name": r.name, "unread": r.unread, "pinned": r.pinned, "muted": r.muted, "time": r.time]
+            if REMARK { owed[r.name] = max(owed[r.name] ?? 0, r.unread); saveOwed(owed) }   // 点开前先记账
             do {
                 try openRow(r.name, allow)
                 let group = isGroupChat()
@@ -1384,12 +1434,19 @@ final class Session {
                 item["new"] = msgs.filter { $0.type == "message" }.count
                 if let n = note { item["note"] = n }
             } catch let e as WXError {
-                if e.code == 6 || e.tag == "MENU_OPEN" { throw e }   // 菜单还开着，继续点下去可能误点
+                if e.code == 6 || e.tag == "MENU_OPEN" {   // 菜单还开着或被切走：不再往下读
+                    // 微信还在最前面就先标回去；被切走了就不抢焦点，留在账上下次补标
+                    if REMARK && e.code != 6 && isFront() {
+                        closeMenuQuietly()
+                        var n: [String] = []
+                        if (try? openChat(HOME_CHAT, &n)) != nil { _ = payOwed(&owed) }
+                    }
+                    throw e
+                }
                 item["error"] = e.msg
             }
             chats.append(item)
         }
-        var notes: [String] = []
         if rows.count > maxChats { notes.append("未读聊天有 \(rows.count) 个，只读了前 \(maxChats) 个") }
         if imagesSkipped > 0 { notes.append("图片超过 \(MAX_IMAGES) 张，有 \(imagesSkipped) 张没取（WX_MAX_IMAGES）") }
         // 读完固定切到文件传输助手：真实聊天一直开着的话，新消息会直接变成已读；切走后读过的聊天才能标回未读
@@ -1397,12 +1454,14 @@ final class Session {
         do { var n: [String] = []; try openChat(HOME_CHAT, &n); back = true }
         catch let e as WXError { notes.append("没能切到「\(HOME_CHAT)」：\(e.msg)") }
         if REMARK && back {
-            for i in chats.indices where chats[i]["messages"] != nil {
+            // 这次点开过的聊天（包括读的时候出错的）都要标回；文件传输助手自己读完就停在上面，不标
+            let done = Set(payOwed(&owed))
+            for i in chats.indices where chats[i]["messages"] != nil || chats[i]["error"] != nil {
                 let name = chats[i]["name"] as! String
-                if sameName(HOME_CHAT, name) { chats[i]["remarked_unread"] = false; continue }
-                chats[i]["remarked_unread"] = (try? markUnread(name)) ?? false
+                chats[i]["remarked_unread"] = done.contains(name) && !sameName(HOME_CHAT, name)
             }
         }
+        if !owed.isEmpty { notes.append("没能标回未读，下次调用会补标：" + owed.keys.sorted().joined(separator: "、")) }
         let out: [String: Any] = ["total": total, "scanned": scanned, "chats": chats, "skipped_no_new": skipped, "notes": notes]
         let data = try JSONSerialization.data(withJSONObject: out, options: [.sortedKeys])
         say(String(data: data, encoding: .utf8)!)

@@ -26,5 +26,13 @@ check("到顶了（整页都见过）", n(prependRows([P, P, P], [P, P, P], know
 check("行元素认得但文字对不上", n(prependRows([m("a"), m("b")], [m("x"), m("y"), m("b")], known: [false, true, false])), nil)
 check("认不出行元素时按文字重叠", n(prependRows([m("b"), m("c")], [m("a"), m("b")], known: [false, false])), 3)
 
+// showsUnread：会话列表这一行是不是显示为未读
+func b(_ x: Bool) -> Int? { x ? 1 : 0 }
+check("普通聊天 N条未读", b(showsUnread("测试号 已置顶 1条未读 [图片]  15:44")), 1)
+check("免打扰群 [N条]", b(showsUnread("项目群 已置顶 [3条] 张三: 好 15:58消息免打扰 ")), 1)
+check("免打扰群标回未读后", b(showsUnread("测试群 已置顶 1条未读 客服00002: 用上了 15:58消息免打扰 ")), 1)
+check("已读", b(showsUnread("测试号 已置顶 [图片]  15:44")), 0)
+check("预览里出现「条未读」三个字不算", b(showsUnread("张三 你有3条未读吗 15:44")), 0)
+
 if failures > 0 { print("\(failures) 个失败"); exit(1) }
 print("全部通过")
