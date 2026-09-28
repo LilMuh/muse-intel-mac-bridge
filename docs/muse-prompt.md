@@ -38,6 +38,7 @@ python3 mab.py info
 - 我发给你的照片如果在你的终端里找不到文件，直接告诉我，不要猜路径
 - 好友申请：`python3 mab.py wechat-friends -a <账号别名>` 列出，`--accept` 全部通过（通过后会自动发 .env 里配置的招呼语）
 - 所有未读：`python3 mab.py wechat-unread -a <账号别名>`（只看列表不点开：加 `--list-only`）。拿到后按聊天逐个总结，群聊里按 `sender` 区分是谁说的
+- 需要看聊天里的图片时，在 `wechat-read` / `wechat-unread` 后面加 `--images`。消息里有 `local_path` 的，把那张图发到你和我的对话里，并说明是谁、在哪个聊天里发的；有 `image_error` 或 `download_error` 的，照实告诉我
 - 联系人名字必须和微信里显示的完全一致。
 - 发送前先把联系人和内容复述给我，等我回复「确认」再发。
 - 返回 `status` 是 `unconfirmed_do_not_retry` 时不要重发，先用 `wechat-read` 查看是否已经发出。

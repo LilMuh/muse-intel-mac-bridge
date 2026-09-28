@@ -104,6 +104,7 @@ python3 mab.py wechat-read "联系人" -n 10 -a work           # 读微信聊天
 python3 mab.py wechat-send "联系人" "内容" -a work          # 发微信；加 --dry-run 只粘贴不发送
 python3 mab.py wechat-send "联系人" --image photo.jpg -a work # 发一张图片（见下文）
 python3 mab.py wechat-unread -a work                       # 读所有未读聊天的新消息（见下文）
+python3 mab.py wechat-unread --images -a work              # 同时把图片下载下来（见下文）
 python3 mab.py wechat-friends --accept -a work             # 通过所有好友申请（见下文）
 ```
 
@@ -293,6 +294,29 @@ python3 mab.py wechat-thumb clip-xxx.png       # 下载缩略图（长边 512）
 - 发完不会自动删除，`outbox/` 需要自己清理。
 - 发图片和发文字一样，计入发送间隔和每天的发送上限。
 
+### 读图片
+
+`wechat-read` 和 `wechat-unread` 加上 `--images`，读到图片消息时会把原图取出来：在 Mac 上右键图片 →「复制」→ 存进仓库的 `inbox/`（不会提交到 Git），然后 mab 自动下载到 Muse 那边的 `./wechat-images/`，并在这条消息上加 `local_path`。
+
+```bash
+python3 mab.py wechat-read "张三" -n 10 --images -a work
+python3 mab.py wechat-unread --images -a work
+```
+
+返回示例：
+```json
+{"type": "message", "text": "图片", "image": "in-20260928-141500-1.png",
+ "local_path": "/home/muse/wechat-images/in-20260928-141500-1.png"}
+```
+
+**注意：**
+- 默认不取图。每张要右键复制一次，大约 1 秒；每次最多 10 张（`--max-images`，最多 50），超出的会写在 `notes` 里。
+- 取到的是原图尺寸（微信会重新编码，文件和对方发的不完全相同）。别人刚发来、你还没点开的图也能取到原图。
+- 取不到的图片，这条消息会有 `image_error` 说明原因，其他消息照常返回。
+- 读的过程中剪贴板会被用到，读完会恢复原样。
+- `inbox/` 里的图片保留 3 天（`WX_INBOX_DAYS`），下次带 `--images` 读的时候自动清理。
+- **隐私**：带 `--images` 时，别人发给你的图片会传到 Muse 的云端 VM。群聊里的图片尤其注意，需要时再开。
+
 ### 限制
 
 - `wechat-read` 只能读到聊天窗口里当前加载出来的消息（通常是最近十几条），也分不出每条是谁发的。
@@ -315,8 +339,8 @@ python3 mab.py wechat-thumb clip-xxx.png       # 下载缩略图（长边 512）
 | POST | `/type` | `{"text"}` | 输入文字（支持中文） |
 | POST | `/key` | `{"keys":[...]}` | 按键或组合键 |
 | POST | `/wechat/send` | `{"to","text" 或 "image","account?","dry_run?"}` | 发微信文字或 outbox 里的一张图片（见上文） |
-| POST | `/wechat/read` | `{"chat","limit?","account?"}` | 读聊天记录，默认 20 条 |
-| POST | `/wechat/unread` | `{"account?","list_only?","max_chats?","max_messages?"}` | 读所有未读聊天的新消息 |
+| POST | `/wechat/read` | `{"chat","limit?","account?","images?","max_images?"}` | 读聊天记录，默认 20 条 |
+| POST | `/wechat/unread` | `{"account?","list_only?","max_chats?","max_messages?","images?","max_images?"}` | 读所有未读聊天的新消息 |
 | POST | `/wechat/forget` | `{"chat","account?"}` | 删掉某个聊天的读取记录 |
 | POST | `/wechat/prune` | `{"days?","account?"}` | 删掉 N 天没更新的读取记录 |
 | POST | `/wechat/friends` | `{"account?","accept?"}` | 列出 / 通过好友申请 |
@@ -324,6 +348,7 @@ python3 mab.py wechat-thumb clip-xxx.png       # 下载缩略图（长边 512）
 | POST | `/wechat/image/clipboard` | `{"name?"}` | Mac 剪贴板里的图片存进 outbox |
 | GET | `/wechat/images` | — | 列出 outbox 里的图片 |
 | GET | `/wechat/image/thumb?file=` | — | 缩略图（JPEG，长边 512） |
+| GET | `/wechat/inbox/file?file=` | — | 读消息时取到的原图 |
 
 注意：操作前至少要调用一次 `/screenshot`，服务才知道该用哪个坐标系。
 
@@ -344,6 +369,9 @@ python3 mab.py wechat-thumb clip-xxx.png       # 下载缩略图（长边 512）
 | `WX_CURSOR_DAYS` | `3` | 读取记录保留几天 |
 | `WX_FRIEND_GREETING` | 空 | 通过好友申请后自动发的第一句话 |
 | `WX_IMAGE_MAX_MB` | `50` | 单张图片上限（按上传请求的大小粗略检查） |
+| `WX_MAX_IMAGES` | `10` | 读消息带图时，每次最多取几张 |
+| `WX_IMAGE_WAIT` | `3` | 点「复制」后，最多等几秒让剪贴板出现图片 |
+| `WX_INBOX_DAYS` | `3` | `inbox/` 里的图片保留几天 |
 
 ## 安全须知
 
