@@ -1226,6 +1226,7 @@ final class Session {
     }
 
     var imagesTaken = 0, imagesSkipped = 0
+    var cursorsToSave: [(String, [Msg])] = []   // 成功输出结果后才保存，中途退出时下次还能读到这些消息
 
     /// 这一行是图片就复制出来存进 inbox；超过张数上限的只计数
     func takeImage(_ i: Int, _ row: Row, _ msgs: inout [Msg]) throws {
@@ -1346,7 +1347,7 @@ final class Session {
             }
             result = Array(all[start...])
         }
-        saveCursor(r.name, all)
+        cursorsToSave.append((r.name, all))
         let final = Array(result!.suffix(maxMsgs * 2))
         let senders = SENDERS && group   // 私聊的发送人就是这个聊天本身，不用点头像
         if senders || IMAGES {
@@ -1364,7 +1365,7 @@ final class Session {
 
     /// 读所有要读的未读聊天；读完切到文件传输助手
     func printUnreadDetails(_ allow: [String], _ maxChats: Int, _ maxMsgs: Int) throws {
-        imagesTaken = 0; imagesSkipped = 0
+        imagesTaken = 0; imagesSkipped = 0; cursorsToSave = []
         // 先切到前台，AX 树才有内容
         try activate()
         W = try ensureWindow()
@@ -1405,6 +1406,7 @@ final class Session {
         let out: [String: Any] = ["total": total, "scanned": scanned, "chats": chats, "skipped_no_new": skipped, "notes": notes]
         let data = try JSONSerialization.data(withJSONObject: out, options: [.sortedKeys])
         say(String(data: data, encoding: .utf8)!)
+        for (name, all) in cursorsToSave { saveCursor(name, all) }
     }
 
     // MARK: 好友申请
@@ -2071,11 +2073,8 @@ case "$1" in
     fi ;;
 esac
 
-# ---------- 读图：图片存到仓库的 inbox/，每次读图前清掉 N 天前的 ----------
+# ---------- 读图：图片存到仓库的 inbox/（由 bridge 负责清理，会跳过待处理消息还在用的图）----------
 export WX_INBOX="$(cd "$DIR/.." && pwd)/inbox"
-if [[ "${WX_IMAGES:-}" == "1" && -d "$WX_INBOX" ]]; then
-  find "$WX_INBOX" -type f -name 'in-*' -mmin +$(( ${WX_INBOX_DAYS:-3} * 1440 )) -delete
-fi
 
 build
 
