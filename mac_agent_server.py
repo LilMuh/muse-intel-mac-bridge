@@ -20,6 +20,11 @@ muse-intel-mac-bridge · Mac 端服务
   POST /wechat/forget {"chat":"联系人","account":"work"}      删某个聊天的读取进度
   POST /wechat/prune  {"days":3,"account":"work"}             删 N 天没更新的读取进度
   POST /wechat/friends {"account":"work","accept":false}      列出（accept=true 时通过）好友申请
+  POST /wechat/send   {"to":"联系人","image":"a.jpg"}          发 outbox 里的一张图片（text 和 image 二选一）
+  POST /wechat/image/upload    {"name":"a.jpg","data":"<base64>"}  图片存进 outbox
+  POST /wechat/image/clipboard {"name":"x.png"}                  Mac 剪贴板里的图片存进 outbox
+  GET  /wechat/images                                           列出 outbox 里的图片
+  GET  /wechat/image/thumb?file=a.jpg                           缩略图（长边 512 的 JPEG）
                       微信接口调用 wx-send.sh，按名字精确匹配，不需要截图和坐标
 
 所有坐标都是「最近一次截图上的像素坐标」，服务自动换算成 macOS 逻辑坐标，
@@ -34,7 +39,9 @@ Retina 缩放与截图缩放比例 agent 都无需关心。
   WX_SEND       wx-send.sh 的路径，默认用仓库里的 wechat/wx-send.sh
   WX_ACCOUNTS   微信账号：别名=App 路径，多个用逗号分隔（只开一个微信可不填）
   WX_FRIEND_GREETING  通过好友申请后自动发的第一句话（不填就不发）
+  WX_IMAGE_MAX_MB  单张图片上限，默认 20
 """
+import base64
 import hmac
 import json
 import os
@@ -46,9 +53,9 @@ import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Optional, Tuple
-from urllib.parse import urlparse
+from urllib.parse import parse_qs, urlparse
 
-__version__ = "0.2.0"
+__version__ = "0.3.0"
 
 if sys.platform != "darwin":
     raise SystemExit("mac_agent_server.py 只能在 macOS 上运行 / This server only runs on macOS.")
@@ -245,9 +252,18 @@ def text_arg(p, k):
 
 
 def a_wechat_send(p):
-    to, text = text_arg(p, "to"), text_arg(p, "text")
+    to = text_arg(p, "to")
+    if bool(p.get("text")) == bool(p.get("image")):
+        raise ValueError("text 和 image 要给一个，且只能给一个")
+    if p.get("image"):
+        path = outbox_path(p["image"])
+        if not os.path.isfile(path):
+            raise ValueError(f"outbox 里没有 {p['image']}（先用 /wechat/image/upload 或 /wechat/image/clipboard 放进去）")
+        args = ["--image", to, path]
+    else:
+        args = [to, text_arg(p, "text")]
     env = {"WX_DRY_RUN": "1"} if p.get("dry_run") else {}
-    code, out, err = run_wx([to, text], p.get("account"), env)
+    code, out, err = run_wx(args, p.get("account"), env)
     return {"ok": code == 0, "code": code, "status": WX_STATUS.get(code, "error"),
             "dry_run": bool(p.get("dry_run")), "output": "\n".join(x for x in (out, err) if x)}
 
@@ -300,12 +316,71 @@ def a_wechat_friends(p):
     return wx_json(*run_wx(args, p.get("account"), timeout=900))
 
 
+def a_wechat_image_upload(p):
+    try:
+        data = base64.b64decode(text_arg(p, "data"), validate=True)
+    except ValueError:   # 包括 binascii.Error 和非 ASCII 字符
+        raise ValueError("data 不是合法的 base64")
+    if len(data) > IMAGE_MAX:
+        raise ValueError(f"图片太大，最大 {IMAGE_MAX // 1048576} MB（WX_IMAGE_MAX_MB）")
+    return {"ok": True, **image_info(save_image(data, p.get("name")))}
+
+
+def a_wechat_image_clipboard(p):
+    fd, tmp = tempfile.mkstemp(suffix=".png")
+    os.close(fd)
+    try:
+        # 剪贴板里没有图片时，第一行就会报错退出
+        subprocess.run(["osascript", "-e", "on run argv",
+                        "-e", "set d to the clipboard as «class PNGf»",
+                        "-e", "set f to open for access (POSIX file (item 1 of argv)) with write permission",
+                        "-e", "write d to f", "-e", "close access f", "-e", "end run", tmp],
+                       capture_output=True, timeout=30)
+        with open(tmp, "rb") as f:
+            data = f.read()
+    finally:
+        os.remove(tmp)
+    if image_kind(data) != "png":
+        raise ValueError("剪贴板里没有图片（Finder 里复制的文件不算，要复制图片本身）")
+    return {"ok": True, **image_info(save_image(data, p.get("name") or time.strftime("clip-%Y%m%d-%H%M%S")))}
+
+
+def list_images():
+    images = []
+    for f in os.listdir(OUTBOX) if os.path.isdir(OUTBOX) else []:
+        try:
+            info = image_info(f)
+        except (ValueError, subprocess.CalledProcessError):
+            continue
+        info["mtime"] = int(os.path.getmtime(outbox_path(f)))
+        images.append(info)
+    images.sort(key=lambda i: (-i["mtime"], i["file"]))
+    return {"ok": True, "images": images}
+
+
+def thumbnail(file):
+    """outbox 里图片的缩略图：长边 512 的 JPEG。"""
+    path = outbox_path(file)
+    if not os.path.isfile(path):
+        raise ValueError(f"outbox 里没有 {file}")
+    fd, out = tempfile.mkstemp(suffix=".jpg")
+    os.close(fd)
+    try:
+        subprocess.run(["sips", "-Z", "512", "-s", "format", "jpeg", "-s", "formatOptions", "70", path, "--out", out],
+                       check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        with open(out, "rb") as f:
+            return f.read()
+    finally:
+        os.remove(out)
+
+
 ACTIONS = {
     "click": a_click, "move": a_move, "drag": a_drag,
     "scroll": a_scroll, "type": a_type, "key": a_key,
     "wechat/send": a_wechat_send, "wechat/read": a_wechat_read,
     "wechat/unread": a_wechat_unread, "wechat/forget": a_wechat_forget, "wechat/prune": a_wechat_prune,
     "wechat/friends": a_wechat_friends,
+    "wechat/image/upload": a_wechat_image_upload, "wechat/image/clipboard": a_wechat_image_clipboard,
 }
 
 
@@ -338,6 +413,11 @@ class Handler(BaseHTTPRequestHandler):
                     data, w, h = take_screenshot()
                 return self._send(200, data, "image/jpeg",
                                   {"X-Image-Width": w, "X-Image-Height": h})
+            if path == "/wechat/images":
+                return self._send(200, list_images())
+            if path == "/wechat/image/thumb":
+                file = parse_qs(urlparse(self.path).query).get("file", [""])[0]
+                return self._send(200, thumbnail(file), "image/jpeg")
             if path == "/info":
                 pw, ph = pyautogui.size()
                 return self._send(200, {
@@ -347,6 +427,8 @@ class Handler(BaseHTTPRequestHandler):
                     "actions": sorted(ACTIONS),
                 })
             return self._send(404, {"error": "not found"})
+        except ValueError as e:
+            return self._send(400, {"error": str(e)})
         except Exception as e:
             return self._send(500, {"error": str(e)})
 
@@ -358,6 +440,14 @@ class Handler(BaseHTTPRequestHandler):
             return self._send(404, {"error": "unknown action"})
         try:
             length = int(self.headers.get("Content-Length", 0))
+            if length > IMAGE_MAX * 4 // 3 + 65536:
+                # 分块读掉丢弃：不读完就回复的话，客户端常收到连接重置而不是 413
+                while length > 0:
+                    chunk = self.rfile.read(min(length, 65536))
+                    if not chunk:
+                        break
+                    length -= len(chunk)
+                return self._send(413, {"error": f"请求太大，图片最大 {IMAGE_MAX // 1048576} MB（WX_IMAGE_MAX_MB）"})
             payload = json.loads(self.rfile.read(length) or b"{}")
             with lock:
                 result = action(payload)
@@ -376,6 +466,7 @@ def main():
         raise SystemExit("请设置 AGENT_TOKEN（至少 16 位随机字符）/ set AGENT_TOKEN (>= 16 chars)")
     print(f"muse-intel-mac-bridge {__version__} listening on http://{HOST}:{PORT} "
           f"(screenshot width {TARGET_W})", flush=True)
+    os.makedirs(OUTBOX, exist_ok=True)
     ThreadingHTTPServer((HOST, PORT), Handler).serve_forever()
 
 
