@@ -95,14 +95,15 @@ usage() { sed -n '2,22p' "$0" | sed 's/^# \{0,1\}//' >&2; exit 64; }
 
 build() {
   mkdir -p "$CACHE"
-  local src="$CACHE/wxsend.swift" new="$CACHE/wxsend.new.swift"
+  # 临时文件带进程号：同时有两个调用在编译时互不覆盖；最后的 mv 是原子改名，谁后完成谁生效（内容一样）
+  local src="$CACHE/wxsend.swift" new="$CACHE/wxsend.new.$$.swift" out="$BIN.$$.tmp"
   swift_source > "$new"
   if cmp -s "$new" "$src" && [[ -x "$BIN" ]]; then rm -f "$new"; return; fi
-  command -v swiftc >/dev/null || { echo "缺少 swiftc，请先运行：xcode-select --install" >&2; exit 1; }
+  command -v swiftc >/dev/null || { rm -f "$new"; echo "缺少 swiftc，请先运行：xcode-select --install" >&2; exit 1; }
   echo "正在编译（只在首次或脚本更新后进行，约 20–60 秒）…" >&2
   # 编译成功才更新缓存的源码，否则下次会以为没变而运行旧程序
-  if swiftc -O -target "$(uname -m)-apple-macos13.0" "$new" -o "$BIN.tmp" >&2; then mv "$BIN.tmp" "$BIN"; mv "$new" "$src"
-  else rm -f "$new"; echo "编译失败，请把上面的报错发给我" >&2; exit 1; fi
+  if swiftc -O -target "$(uname -m)-apple-macos13.0" "$new" -o "$out" >&2; then mv "$out" "$BIN"; mv "$new" "$src"
+  else rm -f "$new" "$out"; echo "编译失败，请把上面的报错发给我" >&2; exit 1; fi
 }
 
 # ---------- 参数 ----------
