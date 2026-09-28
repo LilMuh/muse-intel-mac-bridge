@@ -33,6 +33,9 @@ python3 mab.py info
 
 - 读：`python3 mab.py wechat-read "联系人" -n 10 -a <账号别名>`
 - 发：`python3 mab.py wechat-send "联系人" "内容" -a <账号别名>`（加 `--dry-run` 只粘贴不发送）
+- 发图：`python3 mab.py wechat-send "联系人" --image 图片 -a <账号别名>`。你那边的图片路径会自动上传；Mac 剪贴板里的图片先用 `wechat-clip` 存下来，再用返回的文件名发送；`wechat-images` 列出能发的图片
+- 发图前先把联系人和图片复述给我。剪贴板里或 outbox 里的图片，先用 `wechat-thumb 文件名` 下载缩略图给我看，等我回复「确认」再发
+- 我发给你的照片如果在你的终端里找不到文件，直接告诉我，不要猜路径
 - 好友申请：`python3 mab.py wechat-friends -a <账号别名>` 列出，`--accept` 全部通过（通过后会自动发 .env 里配置的招呼语）
 - 所有未读：`python3 mab.py wechat-unread -a <账号别名>`（只看列表不点开：加 `--list-only`）。拿到后按聊天逐个总结，群聊里按 `sender` 区分是谁说的
 - 联系人名字必须和微信里显示的完全一致。

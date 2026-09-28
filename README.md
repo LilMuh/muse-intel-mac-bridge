@@ -102,6 +102,7 @@ python3 mab.py scroll -5 640 400            # 在 (640,400) 处向下滚动
 python3 mab.py drag 100 100 300 300         # 拖拽
 python3 mab.py wechat-read "联系人" -n 10 -a work           # 读微信聊天记录（见下文）
 python3 mab.py wechat-send "联系人" "内容" -a work          # 发微信；加 --dry-run 只粘贴不发送
+python3 mab.py wechat-send "联系人" --image photo.jpg -a work # 发一张图片（见下文）
 python3 mab.py wechat-unread -a work                       # 读所有未读聊天的新消息（见下文）
 python3 mab.py wechat-friends --accept -a work             # 通过所有好友申请（见下文）
 ```
@@ -258,6 +259,40 @@ WX_FRIEND_GREETING='你好，很高兴认识你'
 - 通过的新朋友如果和已有好友同名，以后按名字 `wechat-send` 会返回 `duplicate_name`，给其中一个设个备注就好。
 - 通过的记录会写进发送日志（`FRIEND_ACCEPTED`）。
 
+### 发图片
+
+一次发一张。图片先放进仓库里的 `outbox/` 文件夹（不会提交到 Git），再按文件名发送。**只有 `outbox/` 里的图片能发**，Muse 碰不到 Mac 上的其他文件。
+
+**图片从哪来：**
+
+1. **Muse 那边的图片**（比如你刚在手机上拍了发给 Muse）：
+   ```bash
+   python3 mab.py wechat-send "张三" --image /tmp/photo.jpg -a work
+   ```
+   Muse 的 VM 里有这个文件的话，会自动先上传到 Mac 的 `outbox/`，再发送。上传后发送失败的话，重试时直接写文件名 `--image photo.jpg` 就行，不用再传一遍。
+2. **Mac 剪贴板里的图片**：先在 Mac 上复制一张图片（截图、网页上右键「拷贝图像」），然后：
+   ```bash
+   python3 mab.py wechat-clip             # 返回存下来的文件名，比如 clip-20260928-153000.png
+   python3 mab.py wechat-send "张三" --image clip-20260928-153000.png -a work
+   ```
+   在 Finder 里复制的是文件本身，不是图片，拿不到。
+3. **你自己放进 `outbox/` 的图片**：直接按文件名发送。
+
+**看一眼再发：**
+```bash
+python3 mab.py wechat-images                   # 列出 outbox 里的图片（最新的在前）
+python3 mab.py wechat-thumb clip-xxx.png       # 下载缩略图（长边 512）给你确认
+```
+
+**发送时会核对什么：** 和发文字一样，先核对聊天标题、确认输入框是空的；粘贴后确认输入框里是一张图片；发出后确认聊天记录里多了一条图片消息。读不到输入框时直接停止，不会不核对就发。图片消息目前**不检测**发送失败的红色感叹号，返回的 `output` 里会写「未检测发送失败标记」。
+
+**注意：**
+- 支持 JPG、PNG、GIF、HEIC（HEIC 会自动转成 JPG），单张最大 20 MB（`WX_IMAGE_MAX_MB`）。
+- GIF 动图可能只发出第一帧（粘贴时会转成静态图，还没有验证过）。
+- 文件名里的空格和特殊字符会换成 `_`，重名时自动加 `-1`、`-2`，以返回的 `file` 为准。
+- 发完不会自动删除，`outbox/` 需要自己清理。
+- 发图片和发文字一样，计入发送间隔和每天的发送上限。
+
 ### 限制
 
 - `wechat-read` 只能读到聊天窗口里当前加载出来的消息（通常是最近十几条），也分不出每条是谁发的。
@@ -279,12 +314,16 @@ WX_FRIEND_GREETING='你好，很高兴认识你'
 | POST | `/scroll` | `{"amount","x?","y?"}` | 滚动，正数向上 |
 | POST | `/type` | `{"text"}` | 输入文字（支持中文） |
 | POST | `/key` | `{"keys":[...]}` | 按键或组合键 |
-| POST | `/wechat/send` | `{"to","text","account?","dry_run?"}` | 发微信（见上文） |
+| POST | `/wechat/send` | `{"to","text" 或 "image","account?","dry_run?"}` | 发微信文字或 outbox 里的一张图片（见上文） |
 | POST | `/wechat/read` | `{"chat","limit?","account?"}` | 读聊天记录，默认 20 条 |
 | POST | `/wechat/unread` | `{"account?","list_only?","max_chats?","max_messages?"}` | 读所有未读聊天的新消息 |
 | POST | `/wechat/forget` | `{"chat","account?"}` | 删掉某个聊天的读取记录 |
 | POST | `/wechat/prune` | `{"days?","account?"}` | 删掉 N 天没更新的读取记录 |
 | POST | `/wechat/friends` | `{"account?","accept?"}` | 列出 / 通过好友申请 |
+| POST | `/wechat/image/upload` | `{"name?","data"}` | 图片（base64）存进 outbox |
+| POST | `/wechat/image/clipboard` | `{"name?"}` | Mac 剪贴板里的图片存进 outbox |
+| GET | `/wechat/images` | — | 列出 outbox 里的图片 |
+| GET | `/wechat/image/thumb?file=` | — | 缩略图（JPEG，长边 512） |
 
 注意：操作前至少要调用一次 `/screenshot`，服务才知道该用哪个坐标系。
 
@@ -304,6 +343,7 @@ WX_FRIEND_GREETING='你好，很高兴认识你'
 | `WX_MUTED_ALLOW` | 空 | 读未读时要读的免打扰群，用 `\|` 分隔 |
 | `WX_CURSOR_DAYS` | `3` | 读取记录保留几天 |
 | `WX_FRIEND_GREETING` | 空 | 通过好友申请后自动发的第一句话 |
+| `WX_IMAGE_MAX_MB` | `20` | 单张图片上限 |
 
 ## 安全须知
 
@@ -348,7 +388,7 @@ The official Muse for Mac app ships as arm64-only, so on Intel Macs it fails wit
 - The agent always works in screenshot pixel coordinates; the server maps them to macOS points (Retina-aware).
 - Binds to `127.0.0.1` by default; every request needs a bearer token.
 - Works on Intel and Apple silicon, macOS 12+.
-- Optional WeChat endpoints (`/wechat/send`, `/wechat/read`, `/wechat/unread`, `/wechat/friends`) call `wx-send.sh` on the Mac to send/read messages by exact contact name, with no screenshots involved.
+- Optional WeChat endpoints (`/wechat/send`, `/wechat/read`, `/wechat/unread`, `/wechat/friends`, `/wechat/image/*`) call `wx-send.sh` on the Mac to send text or a single image / read messages by exact contact name, with no screenshots involved. Images must live in the repo's `outbox/` folder (uploaded from the agent's VM, saved from the Mac clipboard, or dropped in by you).
 
 Quick start: `./start.sh` → grant Screen Recording + Accessibility to your terminal → `./start.sh --funnel` → paste [docs/muse-prompt.md](docs/muse-prompt.md) into Muse.
 
