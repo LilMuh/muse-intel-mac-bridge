@@ -141,11 +141,13 @@ class ServerCase(unittest.TestCase):
         server.OUTBOX = os.path.join(self.tmp, "outbox")
         self.calls, self.envs = [], []
         self.wx_out = "✅ 已发送"
+        self.wx_code = 0
+        server.PENDING_DIR = os.path.join(self.tmp, "pending")
 
         def fake_run_wx(args, account=None, env=None, timeout=300):
             self.calls.append(args)
             self.envs.append(env or {})
-            return 0, self.wx_out, ""
+            return self.wx_code, self.wx_out, ""
         orig = server.run_wx
         server.run_wx = fake_run_wx
         self.addCleanup(setattr, server, "run_wx", orig)
@@ -284,6 +286,99 @@ class InboxTest(ServerCase):
         for n in [0, 51]:
             with self.subTest(n=n):
                 self.assertEqual(self.jcall("POST", "/wechat/read", {"chat": "x", "images": True, "max_images": n})[0], 400)
+
+
+class PendingTest(ServerCase):
+    CHATS = {"chats": [{"name": "张三", "group": False, "messages": [
+        {"type": "time", "text": "15:42"}, {"type": "message", "text": "明天几点？"},
+        {"type": "message", "text": "图片", "image": "in-1.png"}]}]}
+
+    def unread(self, chats=None, **p):
+        self.wx_out = json.dumps(chats if chats is not None else self.CHATS)
+        return self.jcall("POST", "/wechat/unread", p)
+
+    def test_unread_adds_pending_marked_new(self):
+        status, body = self.unread()
+        self.assertEqual(status, 200)
+        msgs = body["pending"]["张三"]["messages"]
+        self.assertEqual([(m["id"], m["text"], m["time"], m["new"]) for m in msgs],
+                         [(1, "明天几点？", "15:42", True), (2, "图片", "15:42", True)])
+        self.assertEqual(msgs[1]["image"], "in-1.png")
+
+    def test_pending_survives_next_unread(self):
+        self.unread()
+        _, body = self.unread({"chats": [{"name": "李四", "group": True, "messages": [
+            {"type": "message", "text": "hi", "from": "other", "sender": "王五", "wxid": "w5"}]}]})
+        self.assertNotIn("new", body["pending"]["张三"]["messages"][0])
+        m = body["pending"]["李四"]["messages"][0]
+        self.assertEqual((m["id"], m["new"], m["sender"], m["wxid"], body["pending"]["李四"]["group"]), (3, True, "王五", "w5", True))
+
+    def test_unread_failure_keeps_pending(self):
+        self.unread()
+        self.wx_code = 6
+        _, body = self.unread({"chats": []})
+        self.assertFalse(body["ok"])
+        self.assertEqual(len(body["pending"]["张三"]["messages"]), 2)
+
+    def test_list_only_does_not_add(self):
+        _, body = self.unread(list_only=True)
+        self.assertEqual(body["pending"], {})
+
+    def test_pending_endpoint(self):
+        self.unread()
+        status, body = self.jcall("POST", "/wechat/pending", {})
+        self.assertEqual((status, body["count"]), (200, 2))
+        self.assertNotIn("new", body["pending"]["张三"]["messages"][0])
+
+    def test_ack_all_and_upto_and_unknown(self):
+        self.unread()
+        _, body = self.jcall("POST", "/wechat/ack", {"chat": "张三", "upto_id": 1})
+        self.assertEqual(body["acked"], 1)
+        _, body = self.jcall("POST", "/wechat/pending", {})
+        self.assertEqual([m["id"] for m in body["pending"]["张三"]["messages"]], [2])
+        self.assertEqual(self.jcall("POST", "/wechat/ack", {"chat": "张三"})[1]["acked"], 1)
+        self.assertEqual(self.jcall("POST", "/wechat/pending", {})[1]["pending"], {})
+        self.assertEqual(self.jcall("POST", "/wechat/ack", {"chat": "不存在"})[0], 400)
+
+    def test_send_ok_clears_chat(self):
+        self.unread()
+        _, body = self.jcall("POST", "/wechat/send", {"to": "张三", "text": "三点"})
+        self.assertEqual(body["acked"], 2)
+        self.assertEqual(self.jcall("POST", "/wechat/pending", {})[1]["count"], 0)
+
+    def test_send_not_cleared_on_failure_or_dry_run(self):
+        self.unread()
+        self.wx_code = 10
+        self.assertEqual(self.jcall("POST", "/wechat/send", {"to": "张三", "text": "x"})[1]["acked"], 0)
+        self.wx_code = 0
+        self.assertEqual(self.jcall("POST", "/wechat/send", {"to": "张三", "text": "x", "dry_run": True})[1]["acked"], 0)
+        self.assertEqual(self.jcall("POST", "/wechat/pending", {})[1]["count"], 2)
+
+    def test_accounts_are_separate(self):
+        self.unread(account="work")
+        self.assertEqual(self.jcall("POST", "/wechat/pending", {})[1]["count"], 0)
+        self.assertEqual(self.jcall("POST", "/wechat/pending", {"account": "work"})[1]["count"], 2)
+
+    def test_clear_pending_upto_keeps_later(self):
+        data = {"next_id": 3, "chats": {"x": {"group": False, "messages": [{"id": 1, "text": "a"}, {"id": 2, "text": "b"}]}}}
+        self.assertEqual(server.clear_pending(data, "x", upto=1), 1)
+        self.assertEqual([m["id"] for m in data["chats"]["x"]["messages"]], [2])
+
+    def test_save_is_atomic_replace(self):
+        server.save_pending(None, {"next_id": 1, "chats": {}})
+        self.assertEqual(os.listdir(server.PENDING_DIR), ["default.json"])
+
+    def test_prune_inbox_keeps_pending_images(self):
+        server.INBOX = os.path.join(self.tmp, "inbox")
+        os.makedirs(server.INBOX)
+        for n in ("in-1.png", "in-2.png"):
+            path = os.path.join(server.INBOX, n)
+            with open(path, "wb") as f:
+                f.write(png())
+            os.utime(path, (1, 1))
+        self.unread()   # 缓存里引用了 in-1.png
+        server.prune_inbox(3)
+        self.assertEqual(sorted(os.listdir(server.INBOX)), ["in-1.png"])
 
 
 class MabTest(ServerCase):

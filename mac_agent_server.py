@@ -20,6 +20,8 @@ muse-intel-mac-bridge · Mac 端服务
   POST /wechat/forget {"chat":"联系人","account":"work"}      删某个聊天的读取进度
   POST /wechat/prune  {"days":3,"account":"work"}             删 N 天没更新的读取进度
   POST /wechat/friends {"account":"work","accept":false}      列出（accept=true 时通过）好友申请
+  POST /wechat/pending {"account":"work"}                     待处理消息（unread 读到、还没回复或 ack 的），不碰微信
+  POST /wechat/ack    {"chat":"联系人","account":"work","upto_id":12}  清掉这个聊天的待处理消息（回复成功时会自动清）
   POST /wechat/send   {"to":"联系人","image":"a.jpg"}          发 outbox 里的一张图片（text 和 image 二选一）
   POST /wechat/image/upload    {"name":"a.jpg","data":"<base64>"}  图片存进 outbox
   POST /wechat/image/clipboard {"name":"x.png"}                  Mac 剪贴板里的图片存进 outbox
@@ -73,6 +75,7 @@ WX_SEND = os.path.expanduser(os.environ.get(
     "WX_SEND", os.path.join(os.path.dirname(os.path.abspath(__file__)), "wechat", "wx-send.sh")))
 OUTBOX = os.path.join(os.path.dirname(os.path.abspath(__file__)), "outbox")
 INBOX = os.path.join(os.path.dirname(os.path.abspath(__file__)), "inbox")
+PENDING_DIR = os.path.expanduser("~/.cache/wx-send/pending")   # 待处理消息缓存：unread 读到的，回复或 ack 后才清
 IMAGE_MAX = int(float(os.environ.get("WX_IMAGE_MAX_MB", "50")) * 1024 * 1024)   # 防止请求过大撑爆内存，不是微信的限制
 IMAGE_EXTS = ("jpg", "jpeg", "png", "gif", "heic")
 IMAGE_NAME = re.compile(r"^[A-Za-z0-9_\u4e00-\u9fff-][A-Za-z0-9._ \u4e00-\u9fff-]*$")   # 允许空格：Mac 截图的文件名带空格
@@ -271,8 +274,15 @@ def a_wechat_send(p):
     else:
         args = [to, text_arg(p, "text")]
     env = {"WX_DRY_RUN": "1"} if p.get("dry_run") else {}
+    # 只清发送前已经交给 Muse 的待处理消息
+    ids = [m["id"] for m in load_pending(p.get("account"))["chats"].get(to, {}).get("messages", [])]
     code, out, err = run_wx(args, p.get("account"), env)
-    return {"ok": code == 0, "code": code, "status": WX_STATUS.get(code, "error"),
+    acked = 0
+    if code == 0 and not p.get("dry_run") and ids:
+        data = load_pending(p.get("account"))
+        acked = clear_pending(data, to, max(ids))
+        save_pending(p.get("account"), data)
+    return {"ok": code == 0, "code": code, "status": WX_STATUS.get(code, "error"), "acked": acked,
             "dry_run": bool(p.get("dry_run")), "output": "\n".join(x for x in (out, err) if x)}
 
 
@@ -291,6 +301,8 @@ def a_wechat_read(p):
     limit = int(p.get("limit", 20))
     if not 1 <= limit <= 200:
         raise ValueError("limit 需在 1–200 之间")
+    if p.get("images"):
+        prune_inbox(inbox_days())
     # 取图每张要右键复制一次，放宽超时
     code, out, err = run_wx(["--read", chat, str(limit)], p.get("account"), image_env(p),
                             timeout=600 if p.get("images") else 300)
@@ -316,8 +328,35 @@ def a_wechat_unread(p):
             env[var] = str(n)
     env.update(image_env(p))
     args = ["--unread"] + (["--list-only"] if p.get("list_only") else [])
+    if p.get("images"):
+        prune_inbox(inbox_days())
     # 要逐个点开聊天、点头像识别发送人，未读多时会很久
-    return wx_json(*run_wx(args, p.get("account"), env, timeout=1800))
+    code, out, err = run_wx(args, p.get("account"), env, timeout=1800)
+    result = wx_json(code, out, err)
+    data, new = load_pending(p.get("account")), set()
+    if result["ok"] and not p.get("list_only"):
+        new = add_pending(data, result.get("chats", []))
+        try:
+            save_pending(p.get("account"), data)
+        except OSError as e:
+            raise ValueError(f"待处理缓存写不进去（{e}），原始输出：{out}")
+    result["pending"] = pending_view(data, new)
+    return result
+
+
+def a_wechat_pending(p):
+    view = pending_view(load_pending(p.get("account")))
+    return {"ok": True, "pending": view, "count": sum(len(c["messages"]) for c in view.values())}
+
+
+def a_wechat_ack(p):
+    chat, data = text_arg(p, "chat"), load_pending(p.get("account"))
+    if chat not in data["chats"]:
+        raise ValueError(f"待处理里没有「{chat}」")
+    upto = p.get("upto_id")
+    n = clear_pending(data, chat, None if upto is None else int(upto))
+    save_pending(p.get("account"), data)
+    return {"ok": True, "acked": n}
 
 
 def a_wechat_forget(p):
@@ -414,12 +453,102 @@ def inbox_file(file):
     return data, "image/" + ("jpeg" if kind == "jpg" else kind)
 
 
+def pending_path(account) -> str:
+    name = account or "default"
+    if "/" in name or name in (".", ".."):
+        raise ValueError(f"账号名不合规：{name!r}")
+    return os.path.join(PENDING_DIR, name + ".json")
+
+
+def load_pending(account) -> dict:
+    try:
+        with open(pending_path(account), encoding="utf-8") as f:
+            return json.load(f)
+    except FileNotFoundError:
+        return {"next_id": 1, "chats": {}}
+
+
+def save_pending(account, data):
+    """先写临时文件再改名，写到一半退出也不会把旧缓存写坏。"""
+    os.makedirs(PENDING_DIR, exist_ok=True)
+    path = pending_path(account)
+    with open(path + ".tmp", "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False)
+    os.replace(path + ".tmp", path)
+
+
+def add_pending(data, chats) -> set:
+    """把 unread 读到的新消息编号放进缓存，时间行写进后面消息的 time；返回新 id。"""
+    now, new = time.strftime("%Y-%m-%dT%H:%M:%S"), set()
+    for c in chats:
+        if not c.get("messages"):
+            continue
+        entry = data["chats"].setdefault(c["name"], {"group": bool(c.get("group")), "messages": []})
+        entry["group"] = bool(c.get("group"))
+        t = None
+        for m in c["messages"]:
+            if m.get("type") == "time":
+                t = m.get("text")
+                continue
+            item = {k: v for k, v in m.items() if k != "type"}
+            item.update(id=data["next_id"], added=now)
+            if t:
+                item["time"] = t
+            if c.get("note"):
+                item["note"] = c["note"]
+            data["next_id"] += 1
+            entry["messages"].append(item)
+            new.add(item["id"])
+    return new
+
+
+def pending_view(data, new_ids=()) -> dict:
+    """缓存里所有还没处理的消息，这次新进来的标 new。"""
+    return {name: {"group": c["group"], "messages": [dict(m, new=True) if m["id"] in new_ids else m for m in c["messages"]]}
+            for name, c in data["chats"].items() if c["messages"]}
+
+
+def clear_pending(data, chat, upto=None) -> int:
+    """清掉这个聊天 id ≤ upto 的待处理消息（upto 为空就全清），返回清掉几条。"""
+    c = data["chats"].get(chat)
+    if not c:
+        return 0
+    keep = [m for m in c["messages"] if upto is not None and m["id"] > upto]
+    n = len(c["messages"]) - len(keep)
+    if keep:
+        c["messages"] = keep
+    else:
+        del data["chats"][chat]
+    return n
+
+
+def prune_inbox(days):
+    """删掉 inbox 里超过 days 天、而且待处理缓存里没有引用的图片。"""
+    keep = set()
+    for f in os.listdir(PENDING_DIR) if os.path.isdir(PENDING_DIR) else []:
+        if f.endswith(".json"):
+            with open(os.path.join(PENDING_DIR, f), encoding="utf-8") as fp:
+                keep |= {m["image"] for c in json.load(fp)["chats"].values() for m in c["messages"] if m.get("image")}
+    cutoff = time.time() - days * 86400
+    for f in os.listdir(INBOX) if os.path.isdir(INBOX) else []:
+        path = os.path.join(INBOX, f)
+        if f.startswith("in-") and f not in keep and os.path.getmtime(path) < cutoff:
+            os.remove(path)
+
+
+def inbox_days() -> int:
+    v = os.environ.get("WX_INBOX_DAYS", "3")
+    if not v.isdigit():
+        raise ValueError(f"WX_INBOX_DAYS 必须是非负整数：{v!r}")
+    return int(v)
+
+
 ACTIONS = {
     "click": a_click, "move": a_move, "drag": a_drag,
     "scroll": a_scroll, "type": a_type, "key": a_key,
     "wechat/send": a_wechat_send, "wechat/read": a_wechat_read,
     "wechat/unread": a_wechat_unread, "wechat/forget": a_wechat_forget, "wechat/prune": a_wechat_prune,
-    "wechat/friends": a_wechat_friends,
+    "wechat/friends": a_wechat_friends, "wechat/pending": a_wechat_pending, "wechat/ack": a_wechat_ack,
     "wechat/image/upload": a_wechat_image_upload, "wechat/image/clipboard": a_wechat_image_clipboard,
 }
 
