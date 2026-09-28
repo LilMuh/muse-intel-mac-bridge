@@ -493,6 +493,25 @@ class MabTest(ServerCase):
         self.assertNotIn("local_path", r.stdout)
         self.assertEqual(self.envs[-1], {})
 
+    def test_pending_and_ack_commands(self):
+        self.wx_out = json.dumps({"chats": [{"name": "张三", "messages": [{"type": "message", "text": "在吗"}]}]})
+        self.assertEqual(self.mab("wechat-unread").returncode, 0)
+        r = self.mab("wechat-pending")
+        self.assertEqual(json.loads(r.stdout)["count"], 1, r.stderr)
+        r = self.mab("wechat-ack", "张三")
+        self.assertEqual(json.loads(r.stdout)["acked"], 1, r.stderr)
+
+    def test_unread_images_downloads_pending_once(self):
+        self.inbox_png()
+        self.wx_out = json.dumps({"chats": [{"name": "张三", "messages": [{"type": "message", "text": "图片", "image": "in-1.png"}]}]})
+        self.mab("wechat-unread")                      # 第一次：进缓存
+        self.wx_out = json.dumps({"chats": []})
+        r = self.mab("wechat-unread", "--images", "--save-dir", "got")   # 第二次：只在 pending 里
+        self.assertEqual(r.returncode, 0, r.stderr)
+        m = json.loads(r.stdout)["pending"]["张三"]["messages"][0]
+        self.assertTrue(os.path.isfile(m["local_path"]))
+        self.assertEqual(os.listdir(os.path.join(self.tmp, "got")), ["in-1.png"])
+
 
 if __name__ == "__main__":
     unittest.main()

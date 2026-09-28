@@ -19,6 +19,8 @@ muse-intel-mac-bridge · 客户端（在 agent 的 Linux VM 里运行，只依�
   python3 mab.py wechat-send "联系人" "消息" [--dry-run] [-a work]
   python3 mab.py wechat-send "联系人" --image 图片 [--dry-run] [-a work]   # VM 里的路径会先上传；否则当作 outbox 里的文件名
   python3 mab.py wechat-unread [--list-only] [--images] [-a work]   # --images：取图片，下载到 ./wechat-images，消息里加 local_path
+  python3 mab.py wechat-pending [-a work]           # 待处理消息（unread 读到、还没回复或 ack 的），不碰微信
+  python3 mab.py wechat-ack "联系人" [--upto ID] [-a work]   # 不需要回复的聊天，手动清掉待处理
   python3 mab.py wechat-forget "联系人" [-a work]
   python3 mab.py wechat-prune [--days 3] [-a work]
   python3 mab.py wechat-friends [--accept] [-a work]
@@ -78,9 +80,14 @@ def upload(path, name=None):
 
 def fetch_images(result, save_dir):
     """把结果里带 image 的消息对应的原图下载到 save_dir，并加上 local_path；单张失败记 download_error。"""
-    msgs = result.get("items", []) + [m for c in result.get("chats", []) for m in c.get("messages", [])]
+    msgs = result.get("items", []) + [m for c in result.get("chats", []) for m in c.get("messages", [])] \
+        + [m for c in result.get("pending", {}).values() for m in c.get("messages", [])]
+    done = {}   # 同一张图（新消息和待处理里各出现一次）只下载一次
     for m in msgs:
         if not m.get("image"):
+            continue
+        if m["image"] in done:
+            m.update(done[m["image"]])
             continue
         # 任何一张出错都只记在这条消息上，保证最后能打印结果（Mac 端已经推进了读取进度）
         try:
@@ -91,9 +98,11 @@ def fetch_images(result, save_dir):
             with open(path, "wb") as f:
                 f.write(body)
         except Exception as e:
-            m["download_error"] = str(e)
+            done[m["image"]] = {"download_error": str(e)}
+            m.update(done[m["image"]])
             continue
-        m["local_path"] = path
+        done[m["image"]] = {"local_path": path}
+        m.update(done[m["image"]])
 
 
 def post_read(path, p, a, timeout):
@@ -130,6 +139,8 @@ def main():
     ws.add_argument("--dry-run", action="store_true"); ws.add_argument("-a", "--account")
     wu = sub.add_parser("wechat-unread"); wu.add_argument("--list-only", action="store_true")
     wu.add_argument("--max-chats", type=int); wu.add_argument("--max-messages", type=int); wu.add_argument("-a", "--account")
+    wpd = sub.add_parser("wechat-pending"); wpd.add_argument("-a", "--account")
+    wak = sub.add_parser("wechat-ack"); wak.add_argument("chat"); wak.add_argument("--upto", type=int); wak.add_argument("-a", "--account")
     for sp in (wr, wu):
         sp.add_argument("--images", action="store_true", help="顺便取图片，下载到 --save-dir")
         sp.add_argument("--max-images", type=int, default=10)
@@ -191,6 +202,13 @@ def main():
         if a.max_chats: p["max_chats"] = a.max_chats
         if a.max_messages: p["max_messages"] = a.max_messages
         post_read("/wechat/unread", p, a, max(TIMEOUT, 1900))
+    elif a.cmd == "wechat-pending":
+        post("/wechat/pending", {"account": a.account})
+    elif a.cmd == "wechat-ack":
+        p = {"chat": a.chat, "account": a.account}
+        if a.upto is not None:
+            p["upto_id"] = a.upto
+        post("/wechat/ack", p)
     elif a.cmd == "wechat-forget":
         post("/wechat/forget", {"chat": a.chat, "account": a.account})
     elif a.cmd == "wechat-prune":
