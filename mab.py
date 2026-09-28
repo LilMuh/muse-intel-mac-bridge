@@ -15,10 +15,10 @@ muse-intel-mac-bridge · 客户端（在 agent 的 Linux VM 里运行，只依�
   python3 mab.py scroll AMOUNT [X Y]        # 正数向上，负数向下
   python3 mab.py type "要输入的文字"
   python3 mab.py key command c              # 组合键，例如 command+c
-  python3 mab.py wechat-read "联系人" [-n 20] [-a work]
+  python3 mab.py wechat-read "联系人" [-n 20] [--images] [-a work]
   python3 mab.py wechat-send "联系人" "消息" [--dry-run] [-a work]
   python3 mab.py wechat-send "联系人" --image 图片 [--dry-run] [-a work]   # VM 里的路径会先上传；否则当作 outbox 里的文件名
-  python3 mab.py wechat-unread [--list-only] [-a work]
+  python3 mab.py wechat-unread [--list-only] [--images] [-a work]   # --images：取图片，下载到 ./wechat-images，消息里加 local_path
   python3 mab.py wechat-forget "联系人" [-a work]
   python3 mab.py wechat-prune [--days 3] [-a work]
   python3 mab.py wechat-friends [--accept] [-a work]
@@ -43,7 +43,7 @@ TOKEN = os.environ.get("MAB_TOKEN", "")
 TIMEOUT = float(os.environ.get("MAB_TIMEOUT", "30"))
 
 
-def request(method, path, payload=None, timeout=TIMEOUT):
+def request(method, path, payload=None, timeout=TIMEOUT, fatal=True):
     if not URL or not TOKEN:
         sys.exit("请先设置 MAB_URL 和 MAB_TOKEN 环境变量 / set MAB_URL and MAB_TOKEN")
     data = json.dumps(payload).encode() if payload is not None else None
@@ -55,9 +55,12 @@ def request(method, path, payload=None, timeout=TIMEOUT):
         with urllib.request.urlopen(req, timeout=timeout) as r:
             return r.read(), dict(r.headers)
     except urllib.error.HTTPError as e:
-        sys.exit(f"HTTP {e.code}: {e.read().decode(errors='replace')}")
+        msg = f"HTTP {e.code}: {e.read().decode(errors='replace')}"
     except urllib.error.URLError as e:
-        sys.exit(f"连接失败 / connection failed: {e.reason}")
+        msg = f"连接失败 / connection failed: {e.reason}"
+    if fatal:
+        sys.exit(msg)
+    raise RuntimeError(msg)
 
 
 def post(path, payload, timeout=TIMEOUT):
@@ -71,6 +74,36 @@ def upload(path, name=None):
     body, _ = request("POST", "/wechat/image/upload",
                       {"name": name or os.path.basename(path), "data": data}, max(TIMEOUT, 120))
     return json.loads(body)
+
+
+def fetch_images(result, save_dir):
+    """把结果里带 image 的消息对应的原图下载到 save_dir，并加上 local_path；单张失败记 download_error。"""
+    msgs = result.get("items", []) + [m for c in result.get("chats", []) for m in c.get("messages", [])]
+    for m in msgs:
+        if not m.get("image"):
+            continue
+        try:
+            body, _ = request("GET", "/wechat/inbox/file?file=" + urllib.parse.quote(m["image"]),
+                              timeout=max(TIMEOUT, 120), fatal=False)
+        except RuntimeError as e:
+            m["download_error"] = str(e)
+            continue
+        os.makedirs(save_dir, exist_ok=True)
+        path = os.path.abspath(os.path.join(save_dir, m["image"]))
+        with open(path, "wb") as f:
+            f.write(body)
+        m["local_path"] = path
+
+
+def post_read(path, p, a, timeout):
+    """read / unread：带 --images 时先下载图片再打印。"""
+    if not a.images:
+        return post(path, p, timeout)
+    p.update(images=True, max_images=a.max_images)
+    body, _ = request("POST", path, p, timeout)
+    result = json.loads(body)
+    fetch_images(result, a.save_dir)
+    print(json.dumps(result, ensure_ascii=False))
 
 
 def main():
@@ -96,6 +129,10 @@ def main():
     ws.add_argument("--dry-run", action="store_true"); ws.add_argument("-a", "--account")
     wu = sub.add_parser("wechat-unread"); wu.add_argument("--list-only", action="store_true")
     wu.add_argument("--max-chats", type=int); wu.add_argument("--max-messages", type=int); wu.add_argument("-a", "--account")
+    for sp in (wr, wu):
+        sp.add_argument("--images", action="store_true", help="顺便取图片，下载到 --save-dir")
+        sp.add_argument("--max-images", type=int, default=10)
+        sp.add_argument("--save-dir", default="wechat-images")
     wf = sub.add_parser("wechat-forget"); wf.add_argument("chat"); wf.add_argument("-a", "--account")
     wp = sub.add_parser("wechat-prune"); wp.add_argument("--days", type=int, default=3); wp.add_argument("-a", "--account")
     wfr = sub.add_parser("wechat-friends"); wfr.add_argument("--accept", action="store_true"); wfr.add_argument("-a", "--account")
@@ -130,8 +167,9 @@ def main():
     elif a.cmd == "key":
         post("/key", {"keys": a.keys})
     elif a.cmd == "wechat-read":
-        # 微信操作要排队（最多 180 秒），超时放宽
-        post("/wechat/read", {"chat": a.chat, "limit": a.limit, "account": a.account}, max(TIMEOUT, 320))
+        # 微信操作要排队（最多 180 秒），取图还要逐张右键复制，超时放宽
+        post_read("/wechat/read", {"chat": a.chat, "limit": a.limit, "account": a.account}, a,
+                  max(TIMEOUT, 620 if a.images else 320))
     elif a.cmd == "wechat-send":
         if (a.text is None) == (a.image is None):
             sys.exit("文字和 --image 要给一个，且只能给一个")
@@ -151,7 +189,7 @@ def main():
         p = {"list_only": a.list_only, "account": a.account}
         if a.max_chats: p["max_chats"] = a.max_chats
         if a.max_messages: p["max_messages"] = a.max_messages
-        post("/wechat/unread", p, max(TIMEOUT, 1900))
+        post_read("/wechat/unread", p, a, max(TIMEOUT, 1900))
     elif a.cmd == "wechat-forget":
         post("/wechat/forget", {"chat": a.chat, "account": a.account})
     elif a.cmd == "wechat-prune":

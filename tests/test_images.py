@@ -350,6 +350,45 @@ class MabTest(ServerCase):
         with open(os.path.join(self.tmp, "t.jpg"), "rb") as f:
             self.assertEqual(f.read(3), b"\xff\xd8\xff")
 
+    def inbox_png(self, name="in-1.png"):
+        server.INBOX = os.path.join(self.tmp, "inbox")
+        os.makedirs(server.INBOX, exist_ok=True)
+        with open(os.path.join(server.INBOX, name), "wb") as f:
+            f.write(png())
+
+    def test_read_images_downloads_and_adds_local_path(self):
+        self.inbox_png()
+        self.wx_out = json.dumps({"chat": "x", "items": [
+            {"type": "message", "text": "图片", "image": "in-1.png"},
+            {"type": "message", "text": "图片", "image": "in-missing.png"},
+            {"type": "message", "text": "hi"}]})
+        r = self.mab("wechat-read", "x", "--images", "--save-dir", "got")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        items = json.loads(r.stdout)["items"]
+        self.assertEqual(os.path.realpath(items[0]["local_path"]),
+                         os.path.realpath(os.path.join(self.tmp, "got", "in-1.png")))
+        with open(items[0]["local_path"], "rb") as f:
+            self.assertEqual(f.read(), png())
+        self.assertIn("download_error", items[1])
+        self.assertNotIn("local_path", items[2])
+        self.assertEqual(self.envs[-1]["WX_IMAGES"], "1")
+
+    def test_unread_images_downloads(self):
+        self.inbox_png()
+        self.wx_out = json.dumps({"chats": [{"name": "g", "messages": [{"type": "message", "text": "图片", "image": "in-1.png"}]}]})
+        r = self.mab("wechat-unread", "--images", "--max-images", "3")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        m = json.loads(r.stdout)["chats"][0]["messages"][0]
+        self.assertTrue(os.path.isfile(m["local_path"]))
+        self.assertEqual(self.envs[-1]["WX_MAX_IMAGES"], "3")
+
+    def test_read_without_images_unchanged(self):
+        self.wx_out = json.dumps({"chat": "x", "items": [{"type": "message", "text": "图片", "image": "in-1.png"}]})
+        r = self.mab("wechat-read", "x")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertNotIn("local_path", r.stdout)
+        self.assertEqual(self.envs[-1], {})
+
 
 if __name__ == "__main__":
     unittest.main()
