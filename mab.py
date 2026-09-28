@@ -140,6 +140,8 @@ def main():
             p["text"] = a.text
         elif os.path.isfile(a.image):
             p["image"] = upload(a.image)["file"]
+            # 重名时服务端会改名，重试要用这个名字
+            print(f"已上传为 outbox 里的 {p['image']}（重试时用 --image {p['image']}）", file=sys.stderr)
         elif "/" in a.image:
             sys.exit(f"找不到文件：{a.image}")
         else:

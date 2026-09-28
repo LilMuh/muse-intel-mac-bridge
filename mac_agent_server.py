@@ -72,7 +72,7 @@ WX_SEND = os.path.expanduser(os.environ.get(
 OUTBOX = os.path.join(os.path.dirname(os.path.abspath(__file__)), "outbox")
 IMAGE_MAX = int(float(os.environ.get("WX_IMAGE_MAX_MB", "20")) * 1024 * 1024)
 IMAGE_EXTS = ("jpg", "jpeg", "png", "gif", "heic")
-IMAGE_NAME = re.compile(r"^[A-Za-z0-9_\u4e00-\u9fff-][A-Za-z0-9._\u4e00-\u9fff-]*$")
+IMAGE_NAME = re.compile(r"^[A-Za-z0-9_\u4e00-\u9fff-][A-Za-z0-9._ \u4e00-\u9fff-]*$")   # 允许空格：Mac 截图的文件名带空格
 
 pyautogui.FAILSAFE = True  # 把鼠标甩到屏幕左上角可紧急中断 agent 的操作
 pyautogui.PAUSE = 0.05
@@ -188,7 +188,7 @@ def outbox_path(file) -> str:
     """outbox 里的文件名 → 绝对路径；不合规或解析后跑出 outbox 就报错。"""
     if not isinstance(file, str) or not IMAGE_NAME.match(file) or ".." in file \
             or "." not in file or file.rsplit(".", 1)[1].lower() not in IMAGE_EXTS:
-        raise ValueError(f"文件名不合规：{file!r}（只能是 outbox 里的 jpg/png/gif/heic 文件名）")
+        raise ValueError(f"文件名不合规：{file!r}（只能是 outbox 里的 jpg/png/gif/heic 文件名，只含字母、数字、中文、空格和 ._-）")
     root = os.path.realpath(OUTBOX)
     path = os.path.realpath(os.path.join(root, file))
     if os.path.dirname(path) != root:
@@ -326,7 +326,15 @@ def a_wechat_image_upload(p):
     return {"ok": True, **image_info(save_image(data, p.get("name")))}
 
 
+def clipboard_has_file():
+    """剪贴板里是不是 Finder 复制的文件（这时能转出来的图片只是文件图标）。"""
+    info = subprocess.run(["osascript", "-e", "clipboard info"], capture_output=True, text=True, timeout=10).stdout
+    return "«class furl»" in info
+
+
 def a_wechat_image_clipboard(p):
+    if clipboard_has_file():
+        raise ValueError("剪贴板里是 Finder 复制的文件，不是图片本身。要发这个文件，把它放进 outbox 再按文件名发送")
     fd, tmp = tempfile.mkstemp(suffix=".png")
     os.close(fd)
     try:

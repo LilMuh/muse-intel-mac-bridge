@@ -269,14 +269,14 @@ WX_FRIEND_GREETING='你好，很高兴认识你'
    ```bash
    python3 mab.py wechat-send "张三" --image /tmp/photo.jpg -a work
    ```
-   Muse 的 VM 里有这个文件的话，会自动先上传到 Mac 的 `outbox/`，再发送。上传后发送失败的话，重试时直接写文件名 `--image photo.jpg` 就行，不用再传一遍。
+   Muse 的 VM 里有这个文件的话，会自动先上传到 Mac 的 `outbox/`，再发送。上传后会打印存下来的文件名（重名时会自动改名，比如 `photo-1.jpg`）；发送失败要重试时，用**这个文件名**（`--image photo-1.jpg`），不用再传一遍。
 2. **Mac 剪贴板里的图片**：先在 Mac 上复制一张图片（截图、网页上右键「拷贝图像」），然后：
    ```bash
    python3 mab.py wechat-clip             # 返回存下来的文件名，比如 clip-20260928-153000.png
    python3 mab.py wechat-send "张三" --image clip-20260928-153000.png -a work
    ```
-   在 Finder 里复制的是文件本身，不是图片，拿不到。
-3. **你自己放进 `outbox/` 的图片**：直接按文件名发送。
+   在 Finder 里复制的是文件，不是图片本身，会返回错误；要发这个文件，把它拖进 `outbox/` 再按文件名发送。
+3. **你自己放进 `outbox/` 的图片**：直接按文件名发送。文件名只能含字母、数字、中文、空格和 `._-`，不能以点开头，否则 `wechat-images` 里看不到。
 
 **看一眼再发：**
 ```bash

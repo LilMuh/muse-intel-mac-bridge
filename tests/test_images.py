@@ -57,6 +57,18 @@ class OutboxTest(unittest.TestCase):
                          os.path.join(os.path.realpath(server.OUTBOX), "a.png"))
         self.assertTrue(server.outbox_path("照片_1.JPG").endswith("照片_1.JPG"))
 
+    def test_outbox_path_allows_spaces_in_hand_dropped_names(self):
+        self.assertTrue(server.outbox_path("截屏2026-09-28 10.00.00.png").endswith("截屏2026-09-28 10.00.00.png"))
+        with self.assertRaises(ValueError):
+            server.outbox_path(" a.png")
+
+    def test_clipboard_rejects_finder_file(self):
+        self.addCleanup(setattr, server, "clipboard_has_file", getattr(server, "clipboard_has_file", None))
+        server.clipboard_has_file = lambda: True
+        with self.assertRaisesRegex(ValueError, "是 Finder 复制的文件"):
+            server.a_wechat_image_clipboard({})
+        self.assertEqual(os.listdir(server.OUTBOX), [])
+
     def test_outbox_path_rejects(self):
         for bad in ["../a.png", "/etc/a.png", "a/b.png", ".a.png", "a..png", "a.txt", "a", "", None, 3]:
             with self.subTest(bad=bad), self.assertRaises(ValueError):
@@ -248,6 +260,13 @@ class MabTest(ServerCase):
         self.assertTrue(os.path.isfile(os.path.join(server.OUTBOX, "photo.png")))
         self.assertEqual(self.calls[-1][:2], ["--image", "文件传输助手"])
         self.assertTrue(self.calls[-1][2].endswith("/outbox/photo.png"))
+
+    def test_send_reports_renamed_upload(self):
+        self.upload("photo.png")
+        r = self.mab("wechat-send", "文件传输助手", "--image", self.local_png())
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("photo-1.png", r.stderr)
+        self.assertTrue(self.calls[-1][2].endswith("/outbox/photo-1.png"))
 
     def test_send_outbox_name(self):
         self.upload("a.png")
