@@ -4,6 +4,7 @@
 # 用法：
 #   ./wx-send.sh -a work "联系人或群名" "消息内容"     发送
 #   ./wx-send.sh -a work --batch 名单.tsv            批量发送（每行：联系人<Tab>消息，消息里的 \n 表示换行）
+#   ./wx-send.sh -a work --image "联系人" 图片路径      发一张图片（粘贴后核对，再发送）
 #   ./wx-send.sh -a work --read "联系人" [条数]         读取聊天记录（JSON，默认最近 20 条，只含当前加载出来的）
 #   ./wx-send.sh -a work --unread [--list-only]          读所有未读聊天的新消息（JSON；免打扰的只读 WX_MUTED_ALLOW 里的群）
 #   ./wx-send.sh -a work --friends [--accept]            列出（加 --accept 则通过）等待验证的好友申请；通过后发 WX_FRIEND_GREETING
@@ -88,7 +89,7 @@ aliases() {
   echo "${out:-无}"
 }
 
-usage() { sed -n '2,21p' "$0" | sed 's/^# \{0,1\}//' >&2; exit 64; }
+usage() { sed -n '2,22p' "$0" | sed 's/^# \{0,1\}//' >&2; exit 64; }
 
 build() {
   mkdir -p "$CACHE"
@@ -337,6 +338,67 @@ func pasteText(_ s: String) {
     pb.setString(s, forType: .string)
     usleep(20_000)
     key(K_V, cmd: true)
+}
+
+/// 把图片放进剪贴板并粘贴；WX_IMAGE_PASTE 只给第 0 步试验切换写法用
+func pasteImage(_ path: String) {
+    let pb = NSPasteboard.general
+    pb.clearContents()
+    let url = URL(fileURLWithPath: path)
+    switch env["WX_IMAGE_PASTE"] ?? "image" {
+    case "url":
+        pb.writeObjects([url as NSURL])
+    case "data":
+        let types: [String: NSPasteboard.PasteboardType] = [
+            "png": .png, "gif": NSPasteboard.PasteboardType("com.compuserve.gif"),
+            "jpg": NSPasteboard.PasteboardType("public.jpeg"), "jpeg": NSPasteboard.PasteboardType("public.jpeg")]
+        if let t = types[url.pathExtension.lowercased()], let d = try? Data(contentsOf: url) { pb.setData(d, forType: t) }
+    default:
+        if let img = NSImage(contentsOf: url) { pb.writeObjects([img]) }
+    }
+    usleep(50_000)
+    key(K_V, cmd: true)
+}
+
+/// 图片消息在聊天记录里的 AX 标题（第 0 步试验确认后改成实测值）
+let IMAGE_ROW_TITLES: Set<String> = ["图片", "[图片]"]
+
+/// 要发的内容：一段文字，或一张图片（文件绝对路径）
+enum Outgoing {
+    case text(String)
+    case image(String)
+
+    var isImage: Bool { if case .image = self { return true }; return false }
+
+    var logText: String {
+        switch self {
+        case .text(let s): return s
+        case .image(let p): return "[图片] " + (p as NSString).lastPathComponent
+        }
+    }
+
+    func paste() {
+        switch self {
+        case .text(let s): pasteText(s)
+        case .image(let p): pasteImage(p)
+        }
+    }
+
+    /// 粘贴后输入框里的内容是不是这条
+    func inBox(_ seen: String) -> Bool {
+        switch self {
+        case .text(let s): return sameInput(seen, s)
+        case .image: return seen.trimmingCharacters(in: .whitespacesAndNewlines) == "\u{FFFC}"
+        }
+    }
+
+    /// 聊天记录的最后一行是不是这条（行尾空格已去掉）
+    func isSentRow(_ title: String) -> Bool {
+        switch self {
+        case .text(let s): return sameInput(title, s)
+        case .image: return IMAGE_ROW_TITLES.contains(title.trimmingCharacters(in: .whitespaces))
+        }
+    }
 }
 
 // MARK: - 截图 + 文字识别
@@ -1317,7 +1379,7 @@ final class Session {
         }
         if !DRY_RUN { rateLimit(account) }
         let t0 = Date()
-        let (st, info) = try sendInChat(name, msg, ["新好友打招呼"])
+        let (st, info) = try sendInChat(name, .text(msg), ["新好友打招呼"])
         writeLog(account, name, st, String(format: "%.1f", Date().timeIntervalSince(t0)), info, msg)
         return st
     }
@@ -1474,15 +1536,15 @@ final class Session {
     }
 
     /// 返回 (状态, 说明)。状态：SENT / DRY_RUN / FAILED / UNCONFIRMED
-    func sendOne(_ contact: String, _ msg: String) throws -> (String, String) {
-        if msg.isEmpty { throw fail(64, "EMPTY_MSG", "消息是空的") }
+    func sendOne(_ contact: String, _ out: Outgoing) throws -> (String, String) {
+        if case .text(let s) = out, s.isEmpty { throw fail(64, "EMPTY_MSG", "消息是空的") }
         var notes: [String] = []
         try openChat(contact, &notes)
-        return try sendInChat(contact, msg, notes)
+        return try sendInChat(contact, out, notes)
     }
 
     /// 在已经打开的聊天里发送（聊天标题已经核对过）
-    func sendInChat(_ contact: String, _ msg: String, _ notesIn: [String]) throws -> (String, String) {
+    func sendInChat(_ contact: String, _ out: Outgoing, _ notesIn: [String]) throws -> (String, String) {
         var notes = notesIn
         W = try ensureWindow()
 
@@ -1501,14 +1563,18 @@ final class Session {
             if !draft.isEmpty {
                 throw fail(7, "DRAFT", "「\(contact)」的输入框里已有内容「\(preview(draft, 20))」，为免连草稿一起发出已停止。请清空后重试")
             }
-            pasteText(msg)
+            out.paste()
             var seen = ""
-            let inBox = waitUntil(1.5, 0.05) {
+            let inBox = waitUntil(out.isImage ? 3 : 1.5, 0.05) {
                 seen = axStr(box, kAXValueAttribute) ?? ""
-                return sameInput(seen, msg)
+                return out.inBox(seen)
             }
             if !inBox { throw fail(4, "INPUT_MISMATCH", "粘贴后输入框里是「\(preview(seen, 20))」，和消息不一致，已停止，未发送") }
         } else {
+            // 截图识别认不出图片，不核对就不发
+            guard case .text(let msg) = out else {
+                throw fail(4, "NO_AX_INPUT", "AX 读不到输入框，无法核对图片，已停止，未发送")
+            }
             notes.append("AX 读不到输入框，改用截图识别")
             let draft = try inputText()
             if !draft.isEmpty {
@@ -1536,16 +1602,20 @@ final class Session {
         if !CONFIRM { return ("SENT", (notes + ["未做发送确认"]).joined(separator: "；")) }
 
         // 4. 确认：「消息」列表多了一行、内容就是这条消息，输入框已清空，旁边没有红色感叹号
+        let wait: Double = out.isImage ? 10 : 3
         if let list = msgList, let box = axInput() {
             var lastSeen = ""
-            let end = Date().addingTimeInterval(3)
+            let end = Date().addingTimeInterval(wait)
             repeat {
                 let rows = axChildren(list)
                 if let row = rows.last {
                     lastSeen = axStr(row, kAXTitleAttribute) ?? ""
                     if lastSeen.hasSuffix(" ") { lastSeen.removeLast() }   // 微信在每条消息后面加了一个空格
                     let isNew = rows.count != rowsBefore.count || rowsBefore.last.map { !CFEqual($0, row) } ?? true
-                    if isNew && sameInput(lastSeen, msg) && (axStr(box, kAXValueAttribute) ?? "x").isEmpty {
+                    if isNew && out.isSentRow(lastSeen) && (axStr(box, kAXValueAttribute) ?? "x").isEmpty {
+                        guard case .text(let msg) = out else {
+                            return ("SENT", (notes + ["未检测发送失败标记"]).joined(separator: "；"))
+                        }
                         if redMarkByOCR(norm(msg)) {
                             return ("FAILED", (notes + ["消息旁出现红色感叹号，发送失败"]).joined(separator: "；"))
                         }
@@ -1554,10 +1624,13 @@ final class Session {
                 }
                 sleepS(0.1)
             } while Date() < end
-            return ("UNCONFIRMED", (notes + ["3 秒内没在聊天记录最后看到这条消息（最后一条：「\(preview(lastSeen, 20))」），可能已发出，请人工确认，不要直接重试"]).joined(separator: "；"))
+            return ("UNCONFIRMED", (notes + ["\(Int(wait)) 秒内没在聊天记录最后看到这条消息（最后一条：「\(preview(lastSeen, 20))」），可能已发出，请人工确认，不要直接重试"]).joined(separator: "；"))
         }
 
         // AX 不可用时：截图识别聊天底部
+        guard case .text(let msg) = out else {
+            return ("UNCONFIRMED", (notes + ["AX 读不到聊天记录，无法确认图片是否发出，请人工确认，不要直接重试"]).joined(separator: "；"))
+        }
         notes.append("AX 读不到聊天记录，改用截图识别确认")
         let g = norm(msg)
         if g.isEmpty { return ("SENT", (notes + ["消息没有文字，未做发送确认"]).joined(separator: "；")) }
@@ -1713,10 +1786,17 @@ func run(_ args: [String]) -> Int32 {
             return 0
         }
 
-        let jobs: [(String, String)]
+        let jobs: [(String, Outgoing)]
         switch mode {
-        case "send" where args.count == 5: jobs = [(args[3], args[4])]
-        case "batch" where args.count == 4: jobs = try parseBatch(args[3])
+        case "send" where args.count == 5: jobs = [(args[3], .text(args[4]))]
+        case "image" where args.count == 5:
+            // 先确认文件是能读的图片，再去碰微信
+            guard let src = CGImageSourceCreateWithURL(URL(fileURLWithPath: args[4]) as CFURL, nil),
+                  CGImageSourceGetCount(src) > 0 else {
+                throw fail(64, "BAD_IMAGE", "读不了图片：\(args[4])")
+            }
+            jobs = [(args[3], .image(args[4]))]
+        case "batch" where args.count == 4: jobs = try parseBatch(args[3]).map { ($0.0, Outgoing.text($0.1)) }
         default: eprint("内部参数错误"); return 64
         }
 
@@ -1732,7 +1812,7 @@ func run(_ args: [String]) -> Int32 {
 
         var worst: Int32 = 0
         for (i, job) in jobs.enumerated() {
-            let (contact, msg) = job
+            let (contact, out) = job
             let tag = jobs.count > 1 ? "[\(i + 1)/\(jobs.count)] " : ""
             let t0 = Date()
             func secs() -> String { String(format: "%.1f", Date().timeIntervalSince(t0)) }
@@ -1744,9 +1824,9 @@ func run(_ args: [String]) -> Int32 {
                     rateLimit(account)
                 }
                 let t1 = Date()
-                let (st, info) = try session.sendOne(contact, msg)
+                let (st, info) = try session.sendOne(contact, out)
                 let s = String(format: "%.1f", Date().timeIntervalSince(t1))
-                writeLog(account, contact, st, s, info, msg)
+                writeLog(account, contact, st, s, info, out.logText)
                 let extra = info.isEmpty ? "" : "（\(info)）"
                 switch st {
                 case "SENT":        say("✅ \(tag)已发送给「\(contact)」，用时 \(s) 秒\(extra)")
@@ -1757,7 +1837,7 @@ func run(_ args: [String]) -> Int32 {
             } catch let e as WXError {
                 if session.inSearch && session.isFront() { key(K_ESC) }
                 session.inSearch = false
-                writeLog(account, contact, "FAILED:" + e.tag, secs(), e.msg, msg)
+                writeLog(account, contact, "FAILED:" + e.tag, secs(), e.msg, out.logText)
                 eprint("❌ \(tag)\(e.msg)")
                 worst = max(worst, e.code)
                 if e.code == 5 || e.code == 6 { break }   // 环境问题或被打断：后面的也不发了
@@ -1832,6 +1912,7 @@ case "$1" in
   --read)  [[ $# -ge 2 && $# -le 3 ]] || usage; exec "$BIN" read "$NAME" "$APP" "$2" "${3:-20}" ;;
   --friends) exec "$BIN" friends "$NAME" "$APP" "$([[ "${2:-}" == "--accept" ]] && echo accept || echo list)" ;;
   --unread) exec "$BIN" unread "$NAME" "$APP" "$([[ "${2:-}" == "--list-only" ]] && echo list || echo details)" ;;
+  --image) [[ $# -eq 3 ]] || usage; exec "$BIN" image "$NAME" "$APP" "$2" "$3" ;;
   -*)      usage ;;
   *)       [[ $# -eq 2 ]] || usage; exec "$BIN" send "$NAME" "$APP" "$1" "$2" ;;
 esac
