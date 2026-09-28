@@ -373,6 +373,15 @@ class MabTest(ServerCase):
         self.assertNotIn("local_path", items[2])
         self.assertEqual(self.envs[-1]["WX_IMAGES"], "1")
 
+    def test_read_images_save_error_keeps_result(self):
+        self.inbox_png()
+        with open(os.path.join(self.tmp, "got"), "w") as f:
+            f.write("不是目录")
+        self.wx_out = json.dumps({"chat": "x", "items": [{"type": "message", "text": "图片", "image": "in-1.png"}]})
+        r = self.mab("wechat-read", "x", "--images", "--save-dir", "got")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("download_error", json.loads(r.stdout)["items"][0])
+
     def test_unread_images_downloads(self):
         self.inbox_png()
         self.wx_out = json.dumps({"chats": [{"name": "g", "messages": [{"type": "message", "text": "图片", "image": "in-1.png"}]}]})

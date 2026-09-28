@@ -656,15 +656,6 @@ struct Msg: Equatable {
 
 let MSG_TIME = #"^(\d{1,2}:\d{2}|昨天.*|前天.*|星期.*|周.*|\d{1,2}月\d{1,2}日.*|\d{4}年.*|\d{1,2}/\d{1,2}.*)$"#
 
-/// 往上翻一页后，把新看到的一页拼到已有记录前面：找新一页尾部和已有记录头部的最长重叠
-func prependPage(_ all: [Msg], _ page: [Msg]) -> [Msg]? {
-    if all.isEmpty { return page }
-    for k in stride(from: min(page.count, all.count), through: 1, by: -1)
-        where Array(page.suffix(k)) == Array(all.prefix(k)) {
-        return Array(page.dropLast(k)) + all
-    }
-    return nil
-}
 
 /// 定位点（上次读到的最后几条消息）之后的记录；找不到定位点返回 nil
 func afterAnchor(_ all: [Msg], _ anchor: [String]) -> [Msg]? {
@@ -677,6 +668,44 @@ func afterAnchor(_ all: [Msg], _ anchor: [String]) -> [Msg]? {
     }
     return nil
 }
+
+// MARK: - 对位（纯函数）
+
+/// 屏幕上这一页在 all 里的起始下标：优先用上一页认得的行（known[k] 是第 k 行在 all 里的下标）；
+/// 认不出时按文字找，只接受唯一的位置；第一页（hi == all.count）必须对上末尾。对不上返回 nil
+func alignPage(_ all: [Msg], _ page: [Msg], hi: Int, known: [Int?]) -> Int? {
+    let n = page.count
+    guard n > 0, n <= all.count else { return nil }
+    func fits(_ j: Int) -> Bool { j >= 0 && j + n <= all.count && all[j..<(j + n)].map { $0.plain } == page }
+    if let k = known.firstIndex(where: { $0 != nil }), let i = known[k] {
+        return fits(i - k) ? i - k : nil
+    }
+    if hi >= all.count { return fits(all.count - n) ? all.count - n : nil }
+    let hits = stride(from: min(hi, all.count) - n, through: 0, by: -1).filter(fits)
+    return hits.count == 1 ? hits[0] : nil
+}
+
+/// 往上翻一页后，把新看到的一页拼到已有记录前面：找新一页尾部和已有记录头部的最长重叠
+func prependPage(_ all: [Msg], _ page: [Msg]) -> [Msg]? {
+    if all.isEmpty { return page }
+    for k in stride(from: min(page.count, all.count), through: 1, by: -1)
+        where Array(page.suffix(k)) == Array(all.prefix(k)) {
+        return Array(page.dropLast(k)) + all
+    }
+    return nil
+}
+
+/// 往上翻了一页后，把新露出来的行接到 all 前面：known[k] 表示第 k 行在上一页见过（按行元素认），
+/// 第一行见过的就是 all[0]，它前面的都是新行；认不出行元素时退回按文字重叠
+func prependRows(_ all: [Msg], _ page: [Msg], known: [Bool]) -> [Msg]? {
+    guard !all.isEmpty else { return page }
+    guard let k = known.firstIndex(of: true) else { return prependPage(all, page) }
+    let rest = Array(page[k...])
+    guard rest.count <= all.count, Array(all.prefix(rest.count)) == rest else { return nil }
+    return Array(page.prefix(k)) + all
+}
+
+// MARK: - 对位结束
 
 /// 会话列表的预览是不是就是这条消息（群里的预览是「发送人: 内容」，图片是「[图片]」）
 func previewIs(_ preview: String, _ text: String) -> Bool {
@@ -1165,16 +1194,19 @@ final class Session {
         guard start < all.count, let box = axFrame(list) else { return }
         scrollListToBottom(list)
         var hi = all.count
+        var seen: [(el: AXUIElement, i: Int)] = []   // 上一页每一行的元素和下标：同名的「图片」行只能靠元素区分
         for _ in 0..<15 {
             let rows = visibleRows(list)
-            let page = rows.map { $0.msg.plain }
-            guard !page.isEmpty, let j = stride(from: min(hi, all.count) - page.count, through: 0, by: -1)
-                    .first(where: { j in j >= 0 && all[j..<(j + page.count)].map { $0.plain } == page }) else { return }
+            let known = rows.map { r in seen.first { CFEqual($0.el, r.el) }?.i }
+            guard let j = alignPage(all, rows.map { $0.msg.plain }, hi: hi, known: known) else {
+                throw fail(4, "ALIGN", "滚动后对不上消息的位置，更早的消息没有处理")
+            }
             for (k, row) in rows.enumerated().reversed() where j + k >= start {
                 try act(j + k, row, &all)
             }
+            seen = rows.enumerated().map { ($0.element.el, j + $0.offset) }
             if j <= start { return }
-            hi = j + page.count - 1
+            hi = j + rows.count - 1
             try guardFront()
             scrollList(list, Int32(box.height * 0.6))
         }
@@ -1285,7 +1317,8 @@ final class Session {
         guard let list = axMessageList(), let box = axFrame(list) else { throw fail(5, "NO_AX", "AX 读不到聊天记录") }
         _ = waitUntil(1, 0.1) { !visibleMessages(list).isEmpty }
         let anchor = loadCursor(r.name) ?? []
-        var all = visibleMessages(list)
+        var rows = visibleRows(list)
+        var all = rows.map { $0.msg }
         func count(_ m: [Msg]) -> Int { m.filter { $0.type == "message" }.count }
         var result: [Msg]? = nil, note: String? = nil
         for _ in 0..<15 {
@@ -1294,8 +1327,12 @@ final class Session {
             if count(all) >= maxMsgs { break }
             try guardFront()
             scrollList(list, Int32(box.height * 0.7))
-            guard let merged = prependPage(all, visibleMessages(list)), merged.count > all.count else { break }   // 到顶了
+            // 连着几条内容一样的消息（比如一串「图片」）只能靠行元素判断翻过了几行
+            let page = visibleRows(list)
+            let known = page.map { r in rows.contains { CFEqual($0.el, r.el) } }
+            guard let merged = prependRows(all, page.map { $0.msg }, known: known), merged.count > all.count else { break }   // 到顶了
             all = merged
+            rows = page
         }
         if result == nil {
             if !anchor.isEmpty { note = "没找到上次读到的位置，可能有更早的新消息没读到" }
@@ -1346,7 +1383,7 @@ final class Session {
                 item["new"] = msgs.filter { $0.type == "message" }.count
                 if let n = note { item["note"] = n }
             } catch let e as WXError {
-                if e.code == 6 { throw e }
+                if e.code == 6 || e.tag == "MENU_OPEN" { throw e }   // 菜单还开着，继续点下去可能误点
                 item["error"] = e.msg
             }
             chats.append(item)
@@ -1643,6 +1680,7 @@ final class Session {
         var notes: [String] = []
         try openChat(contact, &notes)
         guard let list = axMessageList() else { throw fail(5, "NO_AX", "AX 读不到聊天记录") }
+        if IMAGES { scrollListToBottom(list) }   // 取图要从底部逐页对位，先让读到的就是最新的一段
         var items: [Msg] = []
         for row in axChildren(list) {
             // 屏幕外的消息是没有内容的占位元素，读不到

@@ -82,16 +82,17 @@ def fetch_images(result, save_dir):
     for m in msgs:
         if not m.get("image"):
             continue
+        # 任何一张出错都只记在这条消息上，保证最后能打印结果（Mac 端已经推进了读取进度）
         try:
             body, _ = request("GET", "/wechat/inbox/file?file=" + urllib.parse.quote(m["image"]),
                               timeout=max(TIMEOUT, 120), fatal=False)
-        except RuntimeError as e:
+            os.makedirs(save_dir, exist_ok=True)
+            path = os.path.abspath(os.path.join(save_dir, os.path.basename(m["image"])))
+            with open(path, "wb") as f:
+                f.write(body)
+        except Exception as e:
             m["download_error"] = str(e)
             continue
-        os.makedirs(save_dir, exist_ok=True)
-        path = os.path.abspath(os.path.join(save_dir, m["image"]))
-        with open(path, "wb") as f:
-            f.write(body)
         m["local_path"] = path
 
 
