@@ -173,9 +173,8 @@ let IMAGES = env["WX_IMAGES"] == "1"               // 读消息时顺便取图
 let MAX_IMAGES = Int(envD("WX_MAX_IMAGES", 10))
 let IMAGE_WAIT = envD("WX_IMAGE_WAIT", 3)          // 点「复制」后等剪贴板出现图片的秒数
 let INBOX = env["WX_INBOX"] ?? ""
-let IMAGE_DEBUG = env["WX_IMAGE_DEBUG"] == "1"     // 第 0 步实测用，定下来后删掉
-let COPY_TITLES: Set<String> = ["复制", "Copy"]    // 图片右键菜单里的「复制」（实测后改成准确值）
-let IMG_DX = CGFloat(envD("WX_IMG_DX", 110))       // 没有 AXImage 子元素时，气泡中心离这一行左右边缘的距离（实测后定）
+let COPY_TITLE = "复制"                             // 图片右键菜单里的「复制」（实测）
+let IMG_DX = CGFloat(envD("WX_IMG_DX", 110))       // 图片气泡中心离这一行左右边缘的距离（实测：这一行是整宽的 AXStaticText，没有子元素）
 let TITLE_MINX = CGFloat(envD("WX_TITLE_MINX", 270))
 let TITLE_H = CGFloat(envD("WX_TITLE_H", 80))
 let LIST_W = CGFloat(envD("WX_LIST_W", 420))
@@ -1208,19 +1207,17 @@ final class Session {
     /// 右键这张图 →「复制」→ 存进 inbox，返回文件名
     func copyImage(_ row: Row, side: String?) throws -> String {
         if INBOX.isEmpty { throw fail(4, "NO_INBOX", "没有设置 WX_INBOX") }
-        if IMAGE_DEBUG { debugRow(row) }
         let f = row.frame
-        let points: [CGPoint]
-        if let img = axFind(row.el, 0, { axRole($0) == "AXImage" }), let r = axFrame(img), r.width > 4 {
-            points = [CGPoint(x: r.midX, y: r.midY)]
-        } else {
-            let left = CGPoint(x: f.minX + IMG_DX, y: f.midY), right = CGPoint(x: f.maxX - IMG_DX, y: f.midY)
-            points = side == "me" ? [right] : side == "other" ? [left] : [left, right]
-        }
+        // 行可能一部分在列表外（被标题栏挡住），只在露出来的部分上点
+        let v = axMessageList().flatMap { axFrame($0) }.map { f.intersection($0) } ?? f
+        if v.height < 30 { throw fail(4, "OFFSCREEN", "图片只露出一小部分，没取") }
+        // 不知道是谁发的就先左后右：右键到空白处不会弹菜单
+        let left = CGPoint(x: f.minX + IMG_DX, y: v.midY), right = CGPoint(x: f.maxX - IMG_DX, y: v.midY)
+        let points = side == "me" ? [right] : side == "other" ? [left] : [left, right]
         for pt in points {
             if let name = try copyAt(pt, row) { return name }
         }
-        throw fail(4, "NO_COPY", "右键菜单里没有「复制」")
+        throw fail(4, "NO_COPY", "没能在这张图上右键点出「复制」")
     }
 
     /// 在 pt 右键并点「复制」，等剪贴板出现图片后存进 inbox；这个位置不在这一行上、或菜单里没有「复制」时返回 nil
@@ -1237,15 +1234,14 @@ final class Session {
         }
         var item: AXUIElement?
         _ = waitUntil(1, 0.05) {
-            item = contextMenuItems().first { COPY_TITLES.contains(axStr($0, kAXTitleAttribute) ?? "") }
+            item = contextMenuItems().first { axStr($0, kAXTitleAttribute) == COPY_TITLE }
             return item != nil
         }
-        if IMAGE_DEBUG { eprint("菜单：" + contextMenuItems().compactMap { axStr($0, kAXTitleAttribute) }.joined(separator: " | ")) }
         guard let it = item, let r = axFrame(it) else { try closeMenu(); return nil }
         let p = CGPoint(x: r.midX, y: r.midY)
         var onItem: AXUIElement?
         AXUIElementCopyElementAtPosition(AXUIElementCreateSystemWide(), Float(p.x), Float(p.y), &onItem)
-        guard let o = onItem, axRole(o) == "AXMenuItem", COPY_TITLES.contains(axStr(o, kAXTitleAttribute) ?? "") else {
+        guard let o = onItem, axRole(o) == "AXMenuItem", axStr(o, kAXTitleAttribute) == COPY_TITLE else {
             try closeMenu(); return nil
         }
         click(p)
@@ -1256,7 +1252,6 @@ final class Session {
             got = imageFromPasteboard(pb)
             return got != nil
         }
-        if IMAGE_DEBUG { eprint("剪贴板类型：" + (pb.types ?? []).map { $0.rawValue }.joined(separator: ", ")) }
         guard let (data, ext) = got else { throw fail(4, "NO_IMAGE", "点了「复制」，但 \(Int(IMAGE_WAIT)) 秒内剪贴板里没有图片") }
         return try saveInbox(data, ext)
     }
@@ -1282,16 +1277,6 @@ final class Session {
         do { try data.write(to: URL(fileURLWithPath: INBOX + "/" + name)) }
         catch { throw fail(4, "INBOX_WRITE", "图片存不进 \(INBOX)：\(error.localizedDescription)") }
         return name
-    }
-
-    /// 第 0 步实测用：打印这一行的 AX 子树
-    func debugRow(_ row: Row) {
-        func walk(_ e: AXUIElement, _ d: Int) {
-            let f = axFrame(e).map { "x=\(Int($0.minX)) y=\(Int($0.minY)) w=\(Int($0.width)) h=\(Int($0.height))" } ?? "-"
-            eprint(String(repeating: "  ", count: d) + "\(axRole(e)) 「\(axStr(e, kAXTitleAttribute) ?? "")」 \(f)")
-            if d < 4 { axChildren(e).forEach { walk($0, d + 1) } }
-        }
-        walk(row.el, 0)
     }
 
     /// 读这个聊天的新消息：有读取进度就读到定位点为止，没有就读最近 unread 条；最多 maxMsgs 条
