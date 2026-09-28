@@ -277,13 +277,18 @@ def a_wechat_send(p):
     # 只清发送前已经交给 Muse 的待处理消息
     ids = [m["id"] for m in load_pending(p.get("account"))["chats"].get(to, {}).get("messages", [])]
     code, out, err = run_wx(args, p.get("account"), env)
-    acked = 0
+    result = {"ok": code == 0, "code": code, "status": WX_STATUS.get(code, "error"), "acked": 0,
+              "dry_run": bool(p.get("dry_run")), "output": "\n".join(x for x in (out, err) if x)}
     if code == 0 and not p.get("dry_run") and ids:
-        data = load_pending(p.get("account"))
-        acked = clear_pending(data, to, max(ids))
-        save_pending(p.get("account"), data)
-    return {"ok": code == 0, "code": code, "status": WX_STATUS.get(code, "error"), "acked": acked,
-            "dry_run": bool(p.get("dry_run")), "output": "\n".join(x for x in (out, err) if x)}
+        # 消息已经发出去了：清缓存出错也不能报失败，否则 Muse 会重发
+        try:
+            data = load_pending(p.get("account"))
+            n = clear_pending(data, to, max(ids))
+            save_pending(p.get("account"), data)
+            result["acked"] = n
+        except (OSError, ValueError) as e:
+            result["ack_error"] = f"消息已发出，但待处理缓存没清掉：{e}"
+    return result
 
 
 def image_env(p) -> dict:

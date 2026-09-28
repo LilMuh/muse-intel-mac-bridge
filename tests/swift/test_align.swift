@@ -34,5 +34,12 @@ check("免打扰群标回未读后", b(showsUnread("测试群 已置顶 1条未�
 check("已读", b(showsUnread("测试号 已置顶 [图片]  15:44")), 0)
 check("预览里出现「条未读」三个字不算", b(showsUnread("张三 你有3条未读吗 15:44")), 0)
 
+// rowNamed：这一行的聊天名是不是正好是 name（名字后面紧跟置顶、未读标记时才能确定）
+check("置顶的 Tom", b(rowNamed("Tom 已置顶 你好 15:44", "Tom")), 1)
+check("Tom Huang 不是 Tom", b(rowNamed("Tom Huang 已置顶 你好 15:44", "Tom")), 0)
+check("未读的 Tom", b(rowNamed("Tom 3条未读 你好 15:44", "Tom")), 1)
+check("免打扰群 [N条]", b(rowNamed("项目群 [2条] 张三: 好 15:58消息免打扰 ", "项目群")), 1)
+check("没置顶没未读，确定不了", b(rowNamed("Tom 你好 15:44", "Tom")), 0)
+
 if failures > 0 { print("\(failures) 个失败"); exit(1) }
 print("全部通过")

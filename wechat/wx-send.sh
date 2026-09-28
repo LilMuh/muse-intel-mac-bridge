@@ -710,6 +710,12 @@ func showsUnread(_ raw: String) -> Bool {
     raw.range(of: #"(^| )(\d+条未读|\[\d+条\])( |$)"#, options: .regularExpression) != nil
 }
 
+/// 这一行的聊天名是不是正好是 name：名字后面紧跟「已置顶」或未读标记时才能确定（会话行只有一整段文字，分不出名字在哪结束）
+func rowNamed(_ raw: String, _ name: String) -> Bool {
+    guard raw.hasPrefix(name + " ") else { return false }
+    return raw.dropFirst(name.count + 1).range(of: #"^(已置顶|\d+条未读|\[\d+条\])( |$)"#, options: .regularExpression) != nil
+}
+
 // MARK: - 对位结束
 
 /// 会话列表的预览是不是就是这条消息（群里的预览是「发送人: 内容」，图片是「[图片]」）
@@ -1090,7 +1096,9 @@ final class Session {
 
     /// 在会话列表里找到这一行并点开，点开后核对标题
     func openRow(_ name: String, _ allow: [String]) throws {
-        guard let row = findRow({ parseChatRow($0, allow: allow)?.name == name || $0.hasPrefix(name + " ") }) else {
+        // 先按能确定的名字找，找不到再退回「名字开头」（有「Tom」和「Tom Huang」时后者可能认错）
+        guard let row = findRow({ parseChatRow($0, allow: allow)?.name == name || rowNamed($0, name) })
+                ?? findRow({ $0.hasPrefix(name + " ") }) else {
             throw fail(2, "NOT_FOUND", "会话列表里找不到「\(name)」")
         }
         try guardFront()
@@ -1116,7 +1124,8 @@ final class Session {
 
     /// 右键这一行 →「标为未读」。菜单项不支持 AX 按下，只能点击：点击前核对该位置确实是「标为未读」（同一菜单里有「删除」）
     func markUnread(_ name: String) throws -> Bool {
-        guard let row = findRow({ $0.hasPrefix(name + " ") }) else { return false }
+        guard let row = findRow({ rowNamed($0, name) }) ?? findRow({ $0.hasPrefix(name + " ") }) else { return false }
+        if showsUnread(row.raw) { return true }   // 读完后又来了新消息，本来就是未读
         try guardFront()
         for t: CGEventType in [.mouseMoved, .rightMouseDown, .rightMouseUp] {
             CGEvent(mouseEventSource: nil, mouseType: t, mouseCursorPosition: row.center, mouseButton: .right)?.post(tap: .cghidEventTap)
@@ -1444,6 +1453,10 @@ final class Session {
                     throw e
                 }
                 item["error"] = e.msg
+                // 点开的不是这个聊天：实际打开的那个也要记账，之后一起标回未读
+                if REMARK, e.tag == "TITLE_MISMATCH", let t = axTitle().map({ stripCount($0) }), !t.isEmpty, !sameName(t, r.name) {
+                    owed[t] = max(owed[t] ?? 0, 1); saveOwed(owed)
+                }
             }
             chats.append(item)
         }

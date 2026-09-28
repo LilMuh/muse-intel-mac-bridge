@@ -346,6 +346,17 @@ class PendingTest(ServerCase):
         self.assertEqual(body["acked"], 2)
         self.assertEqual(self.jcall("POST", "/wechat/pending", {})[1]["count"], 0)
 
+    def test_send_ok_even_if_cache_write_fails(self):
+        self.unread()
+        orig = server.save_pending
+        def broken(account, data):
+            raise OSError("磁盘满了")
+        server.save_pending = broken
+        self.addCleanup(setattr, server, "save_pending", orig)
+        status, body = self.jcall("POST", "/wechat/send", {"to": "张三", "text": "三点"})
+        self.assertEqual((status, body["ok"], body["acked"]), (200, True, 0))
+        self.assertIn("磁盘满了", body["ack_error"])
+
     def test_send_not_cleared_on_failure_or_dry_run(self):
         self.unread()
         self.wx_code = 10
