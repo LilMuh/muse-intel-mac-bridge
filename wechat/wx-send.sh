@@ -169,6 +169,7 @@ let DAILY_MAX = Int(envD("WX_DAILY_MAX", 500))
 let CONFIRM = env["WX_NO_CONFIRM"] != "1"
 let SENDERS = env["WX_UNREAD_SENDERS"] != "0"   // 读未读时点头像识别发送人
 let REMARK = env["WX_UNREAD_REMARK"] != "0"     // 读完把点开过的聊天标回未读
+let HOME_CHAT = "文件传输助手"                    // 读完未读后停在这个聊天
 let IMAGES = env["WX_IMAGES"] == "1"               // 读消息时顺便取图
 let MAX_IMAGES = Int(envD("WX_MAX_IMAGES", 10))
 let IMAGE_WAIT = envD("WX_IMAGE_WAIT", 3)          // 点「复制」后等剪贴板出现图片的秒数
@@ -1324,14 +1325,13 @@ final class Session {
         return (Array(all.suffix(final.count)), note)
     }
 
-    /// 读所有要读的未读聊天；读完切回原来打开的聊天
+    /// 读所有要读的未读聊天；读完切到文件传输助手
     func printUnreadDetails(_ allow: [String], _ maxChats: Int, _ maxMsgs: Int) throws {
         imagesTaken = 0; imagesSkipped = 0
-        // 先切到前台，AX 树才有内容，才能记下原来打开的聊天
+        // 先切到前台，AX 树才有内容
         try activate()
         W = try ensureWindow()
         _ = waitUntil(1, 0.1) { axTitle() != nil }
-        let original = axTitle().map { stripCount($0) }
         let (total, rows, scanned) = try scanUnread(allow)
         var chats: [[String: Any]] = [], skipped: [String] = []
         for r in rows.prefix(maxChats) {
@@ -1354,19 +1354,14 @@ final class Session {
         var notes: [String] = []
         if rows.count > maxChats { notes.append("未读聊天有 \(rows.count) 个，只读了前 \(maxChats) 个") }
         if imagesSkipped > 0 { notes.append("图片超过 \(MAX_IMAGES) 张，有 \(imagesSkipped) 张没取（WX_MAX_IMAGES）") }
-        let opened = chats.filter { $0["messages"] != nil }.compactMap { $0["name"] as? String }
-        // 切回原来的聊天；原来没打开聊天的话，切到一个本来就没有未读的聊天，这样读过的聊天都能标回未读
+        // 读完固定切到文件传输助手：真实聊天一直开着的话，新消息会直接变成已读；切走后读过的聊天才能标回未读
         var back = false
-        if let o = original, !o.isEmpty {
-            do { var n: [String] = []; try openChat(o, &n); back = true } catch { notes.append("没能切回原来的聊天「\(o)」") }
-        } else if !opened.isEmpty, let row = findRow({ raw in !raw.contains("条未读") && raw.range(of: #"\[\d+条\]"#, options: .regularExpression) == nil
-                                                     && !opened.contains(where: { raw.hasPrefix($0 + " ") }) }) {
-            click(row.center); usleep(500_000); back = true
-        }
+        do { var n: [String] = []; try openChat(HOME_CHAT, &n); back = true }
+        catch let e as WXError { notes.append("没能切到「\(HOME_CHAT)」：\(e.msg)") }
         if REMARK && back {
             for i in chats.indices where chats[i]["messages"] != nil {
                 let name = chats[i]["name"] as! String
-                if let o = original, sameName(o, name) { chats[i]["remarked_unread"] = false; continue }
+                if sameName(HOME_CHAT, name) { chats[i]["remarked_unread"] = false; continue }
                 chats[i]["remarked_unread"] = (try? markUnread(name)) ?? false
             }
         }
@@ -1891,7 +1886,7 @@ func run(_ args: [String]) -> Int32 {
                 .map { $0.trimmingCharacters(in: .whitespaces) }.filter { !$0.isEmpty }
             let lockFd = try acquireLock()
             defer { close(lockFd) }
-            let clip = ClipboardBackup()   // 切回原聊天时会用搜索粘贴
+            let clip = ClipboardBackup()   // 切到文件传输助手时会用搜索粘贴
             clipBackup = clip
             let mouse = CGEvent(source: nil)?.location
             defer {
