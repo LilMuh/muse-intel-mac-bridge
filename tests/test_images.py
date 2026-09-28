@@ -230,5 +230,63 @@ class HttpTest(ServerCase):
         self.assertEqual(self.calls, [])
 
 
+class MabTest(ServerCase):
+    def mab(self, *args):
+        env = dict(os.environ, MAB_URL=f"http://127.0.0.1:{self.httpd.server_port}", MAB_TOKEN=TOKEN)
+        return subprocess.run([sys.executable, os.path.join(ROOT, "mab.py"), *args],
+                              capture_output=True, text=True, env=env, cwd=self.tmp, timeout=60)
+
+    def local_png(self, name="photo.png"):
+        path = os.path.join(self.tmp, name)
+        with open(path, "wb") as f:
+            f.write(png())
+        return path
+
+    def test_send_local_file_uploads_then_sends(self):
+        r = self.mab("wechat-send", "文件传输助手", "--image", self.local_png())
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertTrue(os.path.isfile(os.path.join(server.OUTBOX, "photo.png")))
+        self.assertEqual(self.calls[-1][:2], ["--image", "文件传输助手"])
+        self.assertTrue(self.calls[-1][2].endswith("/outbox/photo.png"))
+
+    def test_send_outbox_name(self):
+        self.upload("a.png")
+        r = self.mab("wechat-send", "文件传输助手", "--image", "a.png", "--dry-run")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertTrue(self.calls[-1][2].endswith("/outbox/a.png"))
+        self.assertTrue(json.loads(r.stdout)["dry_run"])
+
+    def test_send_missing_vm_path(self):
+        r = self.mab("wechat-send", "文件传输助手", "--image", "/tmp/nope-mab-test/x.jpg")
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn("找不到文件", r.stderr)
+        self.assertEqual(self.calls, [])
+
+    def test_send_text_and_image_conflict(self):
+        r = self.mab("wechat-send", "文件传输助手", "hi", "--image", "a.png")
+        self.assertNotEqual(r.returncode, 0)
+        r = self.mab("wechat-send", "文件传输助手")
+        self.assertNotEqual(r.returncode, 0)
+        self.assertEqual(self.calls, [])
+
+    def test_send_text_unchanged(self):
+        r = self.mab("wechat-send", "文件传输助手", "hi")
+        self.assertEqual((r.returncode, self.calls), (0, [["文件传输助手", "hi"]]))
+
+    def test_upload_with_name(self):
+        r = self.mab("wechat-upload", self.local_png(), "--name", "x")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(json.loads(r.stdout)["file"], "x.png")
+
+    def test_images_and_thumb(self):
+        self.upload("a.png")
+        r = self.mab("wechat-images")
+        self.assertEqual([i["file"] for i in json.loads(r.stdout)["images"]], ["a.png"])
+        r = self.mab("wechat-thumb", "a.png", "-o", "t.jpg")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        with open(os.path.join(self.tmp, "t.jpg"), "rb") as f:
+            self.assertEqual(f.read(3), b"\xff\xd8\xff")
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -17,18 +17,25 @@ muse-intel-mac-bridge · 客户端（在 agent 的 Linux VM 里运行，只依�
   python3 mab.py key command c              # 组合键，例如 command+c
   python3 mab.py wechat-read "联系人" [-n 20] [-a work]
   python3 mab.py wechat-send "联系人" "消息" [--dry-run] [-a work]
+  python3 mab.py wechat-send "联系人" --image 图片 [--dry-run] [-a work]   # VM 里的路径会先上传；否则当作 outbox 里的文件名
   python3 mab.py wechat-unread [--list-only] [-a work]
   python3 mab.py wechat-forget "联系人" [-a work]
   python3 mab.py wechat-prune [--days 3] [-a work]
   python3 mab.py wechat-friends [--accept] [-a work]
+  python3 mab.py wechat-upload 图片路径 [--name a.jpg]
+  python3 mab.py wechat-clip [--name x.png]          # Mac 剪贴板里的图片存进 outbox
+  python3 mab.py wechat-images                       # 列出 outbox 里的图片
+  python3 mab.py wechat-thumb a.jpg [-o thumb.jpg]   # 下载缩略图
 
 坐标 = 最近一次 screenshot 图片上的像素坐标。
 """
 import argparse
+import base64
 import json
 import os
 import sys
 import urllib.error
+import urllib.parse
 import urllib.request
 
 URL = os.environ.get("MAB_URL", "").rstrip("/")
@@ -58,6 +65,14 @@ def post(path, payload, timeout=TIMEOUT):
     print(body.decode())
 
 
+def upload(path, name=None):
+    with open(path, "rb") as f:
+        data = base64.b64encode(f.read()).decode()
+    body, _ = request("POST", "/wechat/image/upload",
+                      {"name": name or os.path.basename(path), "data": data}, max(TIMEOUT, 120))
+    return json.loads(body)
+
+
 def main():
     ap = argparse.ArgumentParser(description="Control a Mac running mac_agent_server.py")
     sub = ap.add_subparsers(dest="cmd", required=True)
@@ -76,13 +91,18 @@ def main():
     k = sub.add_parser("key"); k.add_argument("keys", nargs="+")
     wr = sub.add_parser("wechat-read"); wr.add_argument("chat")
     wr.add_argument("-n", "--limit", type=int, default=20); wr.add_argument("-a", "--account")
-    ws = sub.add_parser("wechat-send"); ws.add_argument("to"); ws.add_argument("text")
+    ws = sub.add_parser("wechat-send"); ws.add_argument("to"); ws.add_argument("text", nargs="?")
+    ws.add_argument("--image", help="VM 里的图片路径（先上传），或 outbox 里的文件名")
     ws.add_argument("--dry-run", action="store_true"); ws.add_argument("-a", "--account")
     wu = sub.add_parser("wechat-unread"); wu.add_argument("--list-only", action="store_true")
     wu.add_argument("--max-chats", type=int); wu.add_argument("--max-messages", type=int); wu.add_argument("-a", "--account")
     wf = sub.add_parser("wechat-forget"); wf.add_argument("chat"); wf.add_argument("-a", "--account")
     wp = sub.add_parser("wechat-prune"); wp.add_argument("--days", type=int, default=3); wp.add_argument("-a", "--account")
     wfr = sub.add_parser("wechat-friends"); wfr.add_argument("--accept", action="store_true"); wfr.add_argument("-a", "--account")
+    wup = sub.add_parser("wechat-upload"); wup.add_argument("path"); wup.add_argument("--name")
+    wc = sub.add_parser("wechat-clip"); wc.add_argument("--name")
+    sub.add_parser("wechat-images")
+    wt = sub.add_parser("wechat-thumb"); wt.add_argument("file"); wt.add_argument("-o", "--output", default="thumb.jpg")
 
     a = ap.parse_args()
     if a.cmd == "info":
@@ -113,7 +133,18 @@ def main():
         # 微信操作要排队（最多 180 秒），超时放宽
         post("/wechat/read", {"chat": a.chat, "limit": a.limit, "account": a.account}, max(TIMEOUT, 320))
     elif a.cmd == "wechat-send":
-        post("/wechat/send", {"to": a.to, "text": a.text, "dry_run": a.dry_run, "account": a.account}, max(TIMEOUT, 320))
+        if (a.text is None) == (a.image is None):
+            sys.exit("文字和 --image 要给一个，且只能给一个")
+        p = {"to": a.to, "dry_run": a.dry_run, "account": a.account}
+        if a.image is None:
+            p["text"] = a.text
+        elif os.path.isfile(a.image):
+            p["image"] = upload(a.image)["file"]
+        elif "/" in a.image:
+            sys.exit(f"找不到文件：{a.image}")
+        else:
+            p["image"] = a.image   # 当作 outbox 里的文件名
+        post("/wechat/send", p, max(TIMEOUT, 320))
     elif a.cmd == "wechat-unread":
         p = {"list_only": a.list_only, "account": a.account}
         if a.max_chats: p["max_chats"] = a.max_chats
@@ -125,6 +156,17 @@ def main():
         post("/wechat/prune", {"days": a.days, "account": a.account})
     elif a.cmd == "wechat-friends":
         post("/wechat/friends", {"accept": a.accept, "account": a.account}, max(TIMEOUT, 920))
+    elif a.cmd == "wechat-upload":
+        print(json.dumps(upload(a.path, a.name), ensure_ascii=False))
+    elif a.cmd == "wechat-clip":
+        post("/wechat/image/clipboard", {"name": a.name})
+    elif a.cmd == "wechat-images":
+        body, _ = request("GET", "/wechat/images"); print(body.decode())
+    elif a.cmd == "wechat-thumb":
+        body, _ = request("GET", "/wechat/image/thumb?file=" + urllib.parse.quote(a.file))
+        with open(a.output, "wb") as f:
+            f.write(body)
+        print(f"saved {a.output} ({len(body) // 1024} KB)")
 
 
 if __name__ == "__main__":
