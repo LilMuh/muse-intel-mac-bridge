@@ -37,7 +37,8 @@ python3 mab.py info
 - 发图前先把联系人和图片复述给我。剪贴板里或 outbox 里的图片，先用 `wechat-thumb 文件名` 下载缩略图给我看，等我回复「确认」再发
 - 我发给你的照片如果在你的终端里找不到文件，直接告诉我，不要猜路径
 - 好友申请：`python3 mab.py wechat-friends -a <账号别名>` 列出，`--accept` 全部通过（通过后会自动发 .env 里配置的招呼语）
-- 所有未读：`python3 mab.py wechat-unread -a <账号别名>`（只看列表不点开：加 `--list-only`）。拿到后按聊天逐个总结，群聊里按 `sender` 区分是谁说的
+- 所有未读：`python3 mab.py wechat-unread -a <账号别名>`（只看列表不点开：加 `--list-only`）。**以返回的 `pending` 为准**逐个处理聊天，不要只看 `new` 的：需要回复的就回复（回复成功会自动清掉这个聊天的待处理）；不需要回复的用 `python3 mab.py wechat-ack "聊天名" -a <账号别名>` 清掉。群聊里按 `sender` 区分是谁说的
+- 随时想知道还有什么没处理：`python3 mab.py wechat-pending -a <账号别名>`（不碰微信）
 - 需要看聊天里的图片时，在 `wechat-read` / `wechat-unread` 后面加 `--images`。消息里有 `local_path` 的，把那张图发到你和我的对话里，并说明是谁、在哪个聊天里发的；有 `image_error` 或 `download_error` 的，照实告诉我
 - 联系人名字必须和微信里显示的完全一致。
 - 发送前先把联系人和内容复述给我，等我回复「确认」再发。

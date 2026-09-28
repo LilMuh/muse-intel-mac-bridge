@@ -104,6 +104,7 @@ python3 mab.py wechat-read "联系人" -n 10 -a work           # 读微信聊天
 python3 mab.py wechat-send "联系人" "内容" -a work          # 发微信；加 --dry-run 只粘贴不发送
 python3 mab.py wechat-send "联系人" --image photo.jpg -a work # 发一张图片（见下文）
 python3 mab.py wechat-unread -a work                       # 读所有未读聊天的新消息（见下文）
+python3 mab.py wechat-pending -a work                      # 还没处理的消息（见下文「待处理缓存」）
 python3 mab.py wechat-unread --images -a work              # 同时把图片下载下来（见下文）
 python3 mab.py wechat-friends --accept -a work             # 通过所有好友申请（见下文）
 ```
@@ -221,6 +222,19 @@ python3 mab.py wechat-send "张三" "明天下午三点开会" -a work
             "time": "15:40", "remarked_unread": true,
             "messages": [{"type": "message", "text": "方案发群里了", "from": "other", "sender": "李四", "wxid": "lisi_88"}]}]}
 ```
+
+**待处理缓存（不丢消息）：** 通过 bridge 读到的新消息，会先放进 Mac 本地的待处理缓存（`~/.cache/wx-send/pending/`），一直留到处理完为止：
+- 返回里的 `pending` 列出**所有还没处理的消息**（包括以前读到、还没回复的），这次新读到的标 `"new": true`，每条都有 `id`。
+- 用 `wechat-send` 回复某个聊天成功后，会自动清掉这个聊天在回复前的待处理消息（返回里的 `acked` 是清掉的条数）。群里回复一次，就算把这个群处理完了。
+- 不需要回复的聊天，用 `wechat-ack` 手动清掉。
+- `wechat-pending` 随时查看还有什么没处理，不碰微信，马上返回。
+
+```bash
+python3 mab.py wechat-pending -a work              # 查看待处理
+python3 mab.py wechat-ack "项目群" -a work          # 清掉这个聊天的待处理（--upto ID 只清到这一条）
+```
+
+**读了谁就要未读谁：** 点开一个聊天之前会先记账（`~/.cache/wx-send/remark-账号.json`），标回未读之后才销账。读到一半被打断（比如你动了鼠标、微信被切走），没来得及标回未读的聊天，下一次调用 `wechat-unread` 时会先补标，并且按原来的未读条数重新读。读取进度也是成功输出结果之后才保存。
 
 **管理读取记录：**
 ```bash
@@ -340,7 +354,9 @@ python3 mab.py wechat-unread --images -a work
 | POST | `/key` | `{"keys":[...]}` | 按键或组合键 |
 | POST | `/wechat/send` | `{"to","text" 或 "image","account?","dry_run?"}` | 发微信文字或 outbox 里的一张图片（见上文） |
 | POST | `/wechat/read` | `{"chat","limit?","account?","images?","max_images?"}` | 读聊天记录，默认 20 条 |
-| POST | `/wechat/unread` | `{"account?","list_only?","max_chats?","max_messages?","images?","max_images?"}` | 读所有未读聊天的新消息 |
+| POST | `/wechat/unread` | `{"account?","list_only?","max_chats?","max_messages?","images?","max_images?"}` | 读所有未读聊天的新消息，返回里的 `pending` 是所有待处理消息 |
+| POST | `/wechat/pending` | `{"account?"}` | 待处理消息，不碰微信 |
+| POST | `/wechat/ack` | `{"chat","account?","upto_id?"}` | 清掉这个聊天的待处理消息 |
 | POST | `/wechat/forget` | `{"chat","account?"}` | 删掉某个聊天的读取记录 |
 | POST | `/wechat/prune` | `{"days?","account?"}` | 删掉 N 天没更新的读取记录 |
 | POST | `/wechat/friends` | `{"account?","accept?"}` | 列出 / 通过好友申请 |
