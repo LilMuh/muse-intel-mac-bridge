@@ -139,11 +139,13 @@ class ServerCase(unittest.TestCase):
         self.tmp = tempfile.mkdtemp()
         self.addCleanup(shutil.rmtree, self.tmp)
         server.OUTBOX = os.path.join(self.tmp, "outbox")
-        self.calls = []
+        self.calls, self.envs = [], []
+        self.wx_out = "✅ 已发送"
 
         def fake_run_wx(args, account=None, env=None, timeout=300):
             self.calls.append(args)
-            return 0, "✅ 已发送", ""
+            self.envs.append(env or {})
+            return 0, self.wx_out, ""
         orig = server.run_wx
         server.run_wx = fake_run_wx
         self.addCleanup(setattr, server, "run_wx", orig)
@@ -155,6 +157,7 @@ class ServerCase(unittest.TestCase):
         c.request(method, path, body=data, headers={"Authorization": "Bearer " + TOKEN})
         r = c.getresponse()
         out = r.read()
+        self.headers = dict(r.getheaders())
         c.close()
         return r.status, out
 
@@ -239,6 +242,48 @@ class HttpTest(ServerCase):
             with self.subTest(name=name):
                 self.assertEqual(self.jcall("POST", "/wechat/send", {"to": "x", "image": name})[0], 400)
         self.assertEqual(self.calls, [])
+
+
+class InboxTest(ServerCase):
+    def setUp(self):
+        super().setUp()
+        server.INBOX = os.path.join(self.tmp, "inbox")
+        os.makedirs(server.INBOX)
+        with open(os.path.join(server.INBOX, "in-20260928-141500-1.png"), "wb") as f:
+            f.write(png())
+
+    def test_inbox_file(self):
+        status, out = self.call("GET", "/wechat/inbox/file?file=in-20260928-141500-1.png")
+        self.assertEqual((status, out), (200, png()))
+        self.assertEqual(self.headers["Content-Type"], "image/png")
+
+    def test_inbox_file_rejects_bad_or_missing(self):
+        for q in ["../x.png", "nope.png", "", "a/b.png"]:
+            with self.subTest(q=q):
+                self.assertEqual(self.call("GET", "/wechat/inbox/file?file=" + q)[0], 400)
+
+    def test_inbox_does_not_serve_outbox(self):
+        self.upload("a.png")
+        self.assertEqual(self.call("GET", "/wechat/inbox/file?file=a.png")[0], 400)
+
+    def test_read_images_env(self):
+        self.wx_out = '{"chat": "x", "items": []}'
+        self.assertEqual(self.jcall("POST", "/wechat/read", {"chat": "x", "images": True})[0], 200)
+        self.assertEqual(self.envs[-1], {"WX_IMAGES": "1", "WX_MAX_IMAGES": "10"})
+        self.jcall("POST", "/wechat/read", {"chat": "x"})
+        self.assertEqual(self.envs[-1], {})
+
+    def test_unread_images_env(self):
+        self.wx_out = '{"chats": []}'
+        status, _ = self.jcall("POST", "/wechat/unread", {"images": True, "max_images": 3, "max_chats": 2})
+        self.assertEqual(status, 200)
+        self.assertEqual(self.envs[-1], {"WX_UNREAD_MAX_CHATS": "2", "WX_IMAGES": "1", "WX_MAX_IMAGES": "3"})
+
+    def test_max_images_bounds(self):
+        self.wx_out = '{"chat": "x", "items": []}'
+        for n in [0, 51]:
+            with self.subTest(n=n):
+                self.assertEqual(self.jcall("POST", "/wechat/read", {"chat": "x", "images": True, "max_images": n})[0], 400)
 
 
 class MabTest(ServerCase):

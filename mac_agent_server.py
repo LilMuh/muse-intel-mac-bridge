@@ -15,8 +15,8 @@ muse-intel-mac-bridge · Mac 端服务
   POST /type          {"text":"hello 你好"}            非 ASCII 自动走剪贴板粘贴
   POST /key           {"keys":["command","c"]}
   POST /wechat/send   {"to":"联系人","text":"消息","account":"work","dry_run":false}
-  POST /wechat/read   {"chat":"联系人","limit":20,"account":"work"}
-  POST /wechat/unread {"account":"work","list_only":false}   读所有未读聊天的新消息
+  POST /wechat/read   {"chat":"联系人","limit":20,"account":"work","images":false}
+  POST /wechat/unread {"account":"work","list_only":false,"images":false}   读所有未读聊天的新消息；images=true 时顺便取图
   POST /wechat/forget {"chat":"联系人","account":"work"}      删某个聊天的读取进度
   POST /wechat/prune  {"days":3,"account":"work"}             删 N 天没更新的读取进度
   POST /wechat/friends {"account":"work","accept":false}      列出（accept=true 时通过）好友申请
@@ -25,6 +25,7 @@ muse-intel-mac-bridge · Mac 端服务
   POST /wechat/image/clipboard {"name":"x.png"}                  Mac 剪贴板里的图片存进 outbox
   GET  /wechat/images                                           列出 outbox 里的图片
   GET  /wechat/image/thumb?file=a.jpg                           缩略图（长边 512 的 JPEG）
+  GET  /wechat/inbox/file?file=in-xxx.png                       读消息时取到的原图
                       微信接口调用 wx-send.sh，按名字精确匹配，不需要截图和坐标
 
 所有坐标都是「最近一次截图上的像素坐标」，服务自动换算成 macOS 逻辑坐标，
@@ -40,6 +41,7 @@ Retina 缩放与截图缩放比例 agent 都无需关心。
   WX_ACCOUNTS   微信账号：别名=App 路径，多个用逗号分隔（只开一个微信可不填）
   WX_FRIEND_GREETING  通过好友申请后自动发的第一句话（不填就不发）
   WX_IMAGE_MAX_MB  单张图片上限，默认 50（只在请求阶段按请求大小检查）
+  WX_MAX_IMAGES / WX_IMAGE_WAIT / WX_INBOX_DAYS  读图：每次最多几张（10）、复制后等几秒（3）、inbox 保留几天（3）
 """
 import base64
 import hmac
@@ -70,6 +72,7 @@ QUALITY = os.environ.get("JPEG_QUALITY", "60")
 WX_SEND = os.path.expanduser(os.environ.get(
     "WX_SEND", os.path.join(os.path.dirname(os.path.abspath(__file__)), "wechat", "wx-send.sh")))
 OUTBOX = os.path.join(os.path.dirname(os.path.abspath(__file__)), "outbox")
+INBOX = os.path.join(os.path.dirname(os.path.abspath(__file__)), "inbox")
 IMAGE_MAX = int(float(os.environ.get("WX_IMAGE_MAX_MB", "50")) * 1024 * 1024)   # 防止请求过大撑爆内存，不是微信的限制
 IMAGE_EXTS = ("jpg", "jpeg", "png", "gif", "heic")
 IMAGE_NAME = re.compile(r"^[A-Za-z0-9_\u4e00-\u9fff-][A-Za-z0-9._ \u4e00-\u9fff-]*$")   # 允许空格：Mac 截图的文件名带空格
@@ -184,16 +187,21 @@ def clean_stem(name) -> str:
     return re.sub(r"\.{2,}", ".", stem).lstrip(".")[:60]
 
 
-def outbox_path(file) -> str:
-    """outbox 里的文件名 → 绝对路径；不合规或解析后跑出 outbox 就报错。"""
+def safe_path(root, file) -> str:
+    """root 目录里的文件名 → 绝对路径；不合规或解析后跑出 root 就报错。"""
+    where = os.path.basename(root)
     if not isinstance(file, str) or not IMAGE_NAME.match(file) or ".." in file \
             or "." not in file or file.rsplit(".", 1)[1].lower() not in IMAGE_EXTS:
-        raise ValueError(f"文件名不合规：{file!r}（只能是 outbox 里的 jpg/png/gif/heic 文件名，只含字母、数字、中文、空格和 ._-）")
-    root = os.path.realpath(OUTBOX)
-    path = os.path.realpath(os.path.join(root, file))
-    if os.path.dirname(path) != root:
-        raise ValueError(f"文件名不合规：{file!r}（指向了 outbox 外面）")
+        raise ValueError(f"文件名不合规：{file!r}（只能是 {where} 里的 jpg/png/gif/heic 文件名，只含字母、数字、中文、空格和 ._-）")
+    base = os.path.realpath(root)
+    path = os.path.realpath(os.path.join(base, file))
+    if os.path.dirname(path) != base:
+        raise ValueError(f"文件名不合规：{file!r}（指向了 {where} 外面）")
     return path
+
+
+def outbox_path(file) -> str:
+    return safe_path(OUTBOX, file)
 
 
 def save_image(data, name=None) -> str:
@@ -268,12 +276,24 @@ def a_wechat_send(p):
             "dry_run": bool(p.get("dry_run")), "output": "\n".join(x for x in (out, err) if x)}
 
 
+def image_env(p) -> dict:
+    """images=true 时让 wx-send.sh 读消息时顺便取图。"""
+    if not p.get("images"):
+        return {}
+    n = int(p.get("max_images", 10))
+    if not 1 <= n <= 50:
+        raise ValueError("max_images 需在 1–50 之间")
+    return {"WX_IMAGES": "1", "WX_MAX_IMAGES": str(n)}
+
+
 def a_wechat_read(p):
     chat = text_arg(p, "chat")
     limit = int(p.get("limit", 20))
     if not 1 <= limit <= 200:
         raise ValueError("limit 需在 1–200 之间")
-    code, out, err = run_wx(["--read", chat, str(limit)], p.get("account"))
+    # 取图每张要右键复制一次，放宽超时
+    code, out, err = run_wx(["--read", chat, str(limit)], p.get("account"), image_env(p),
+                            timeout=600 if p.get("images") else 300)
     if code != 0:
         return {"ok": False, "code": code, "status": WX_STATUS.get(code, "error"), "output": err or out}
     data = json.loads(out[out.index("{"):])
@@ -294,6 +314,7 @@ def a_wechat_unread(p):
             if not 1 <= n <= hi:
                 raise ValueError(f"{k} 需在 1–{hi} 之间")
             env[var] = str(n)
+    env.update(image_env(p))
     args = ["--unread"] + (["--list-only"] if p.get("list_only") else [])
     # 要逐个点开聊天、点头像识别发送人，未读多时会很久
     return wx_json(*run_wx(args, p.get("account"), env, timeout=1800))
@@ -380,6 +401,19 @@ def thumbnail(file):
         os.remove(out)
 
 
+def inbox_file(file):
+    """inbox 里的原图和它的 Content-Type。"""
+    path = safe_path(INBOX, file)
+    if not os.path.isfile(path):
+        raise ValueError(f"inbox 里没有 {file}")
+    with open(path, "rb") as f:
+        data = f.read()
+    kind = image_kind(data)
+    if kind is None:
+        return data, "application/octet-stream"
+    return data, "image/" + ("jpeg" if kind == "jpg" else kind)
+
+
 ACTIONS = {
     "click": a_click, "move": a_move, "drag": a_drag,
     "scroll": a_scroll, "type": a_type, "key": a_key,
@@ -421,6 +455,9 @@ class Handler(BaseHTTPRequestHandler):
                                   {"X-Image-Width": w, "X-Image-Height": h})
             if path == "/wechat/images":
                 return self._send(200, list_images())
+            if path == "/wechat/inbox/file":
+                file = parse_qs(urlparse(self.path).query).get("file", [""])[0]
+                return self._send(200, *inbox_file(file))
             if path == "/wechat/image/thumb":
                 file = parse_qs(urlparse(self.path).query).get("file", [""])[0]
                 return self._send(200, thumbnail(file), "image/jpeg")
@@ -473,6 +510,7 @@ def main():
     print(f"muse-intel-mac-bridge {__version__} listening on http://{HOST}:{PORT} "
           f"(screenshot width {TARGET_W})", flush=True)
     os.makedirs(OUTBOX, exist_ok=True)
+    os.makedirs(INBOX, exist_ok=True)
     ThreadingHTTPServer((HOST, PORT), Handler).serve_forever()
 
 
