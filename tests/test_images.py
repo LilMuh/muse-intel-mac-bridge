@@ -165,25 +165,38 @@ class NotifyTest(unittest.TestCase):
         self.addCleanup(setattr, server, "NOTIFY_DBS", server.NOTIFY_DBS)
         server.NOTIFY_DBS = [os.path.join(self.tmp, "missing"), self.db]
 
-    def test_reads_after_since_for_this_app_only(self):
-        add_notif(self.db, 1000, body="旧的")
-        add_notif(self.db, 2000, title="张三", body="在吗", chatname="wxid_zs")
-        add_notif(self.db, 2001, title="别的 App", app_id=2)
-        add_notif(self.db, 3000, title=None, body="你收到了一条消息", chatname="custom_id7")
-        got = server.read_notifications("com.test.WeChat", 1500)   # bundle ID 大小写不同也要对上
-        self.assertEqual([(n["chat"], n["id"], n["preview"]) for n in got],
-                         [("张三", "wxid_zs", "在吗"), ("", "custom_id7", "你收到了一条消息")])
-        self.assertEqual(got[0]["time"], time.strftime("%Y-%m-%dT%H:%M:%S", time.localtime(2000)))
-
     def test_bad_usda_keeps_title(self):
         data = plistlib.dumps({"req": {"titl": "张三", "body": "在吗", "usda": b"garbage"}}, fmt=plistlib.FMT_BINARY)
         self.assertEqual(server.parse_notification(data, 0)["id"], "")
         self.assertEqual(server.parse_notification(data, 0)["chat"], "张三")
 
+    def test_reads_after_cursor_for_this_app_only(self):
+        add_notif(self.db, 1000, body="旧的")                                  # rec 1
+        add_notif(self.db, 2000, title="张三", body="在吗", chatname="wxid_zs")   # rec 2
+        add_notif(self.db, 2001, title="别的 App", app_id=2)                    # rec 3
+        add_notif(self.db, 3000, title=None, body="你收到了一条消息", chatname="custom_id7")   # rec 4
+        got = server.read_notifications("com.test.WeChat", cursor=1)          # bundle ID 大小写不同也要对上
+        self.assertEqual([(n["rec"], n["chat"], n["id"], n["preview"]) for n in got["items"]],
+                         [(2, "张三", "wxid_zs", "在吗"), (4, "", "custom_id7", "你收到了一条消息")])
+        self.assertEqual((got["last"], got["lo"], got["hi"]), (4, 1, 4))
+        self.assertEqual(got["items"][0]["time"], time.strftime("%Y-%m-%dT%H:%M:%S", time.localtime(2000)))
+
+    def test_since_and_stats_only(self):
+        add_notif(self.db, 1000)
+        add_notif(self.db, 2000)
+        got = server.read_notifications("com.test.wechat", since=1500)
+        self.assertEqual(([n["rec"] for n in got["items"]], got["last"]), ([2], 2))
+        got = server.read_notifications("com.test.wechat")
+        self.assertEqual((got["items"], got["last"], got["lo"], got["hi"]), ([], None, 1, 2))
+
+    def test_empty_app(self):
+        got = server.read_notifications("com.test.wechat", cursor=0)
+        self.assertEqual((got["items"], got["last"], got["lo"], got["hi"]), ([], None, None, None))
+
     def test_no_database(self):
         server.NOTIFY_DBS = [os.path.join(self.tmp, "missing")]
         with self.assertRaises(OSError):
-            server.read_notifications("com.test.wechat", 0)
+            server.read_notifications("com.test.wechat", cursor=0)
 
     def test_corrupt_database(self):
         bad = os.path.join(self.tmp, "bad")
@@ -191,16 +204,40 @@ class NotifyTest(unittest.TestCase):
             f.write(b"not a database" * 100)
         server.NOTIFY_DBS = [bad]
         with self.assertRaises(OSError):
-            server.read_notifications("com.test.wechat", 0)
+            server.read_notifications("com.test.wechat", cursor=0)
 
-    def test_bad_record_is_skipped(self):
+    def test_bad_record_is_skipped_but_counted(self):
         add_notif(self.db, 2000, body="好的")
         con = sqlite3.connect(self.db)
         con.execute("INSERT INTO record (app_id, data, delivered_date) VALUES (1, ?, ?)", (b"garbage", 2001 - 978307200))
         con.execute("INSERT INTO record (app_id, data, delivered_date) VALUES (1, NULL, ?)", (2002 - 978307200,))
         con.commit()
         con.close()
-        self.assertEqual([n["preview"] for n in server.read_notifications("com.test.wechat", 0)], ["好的"])
+        got = server.read_notifications("com.test.wechat", cursor=0)
+        self.assertEqual(([n["preview"] for n in got["items"]], got["last"]), (["好的"], 3))   # 坏记录也算进 last
+
+    def notice(self, body, chat_id="wxid_zs"):
+        return server.notice_message({"rec": 7, "chat": "x", "id": chat_id, "preview": body,
+                                      "time": "2026-09-29T14:25:30"})
+
+    def test_notice_private_text(self):
+        self.assertEqual(self.notice("明天几点？"), {"time": "14:25", "rec": 7, "text": "明天几点？"})
+
+    def test_notice_needs_read(self):
+        self.assertEqual(self.notice("[图片] ")["needs_read"], ["image"])
+        self.assertEqual(self.notice("一" * 66)["needs_read"], ["truncated"])        # 198 字节
+        self.assertNotIn("needs_read", self.notice("一" * 65))                        # 195 字节
+        self.assertEqual(self.notice("a" * 196)["needs_read"], ["truncated"])
+
+    def test_notice_group(self):
+        g = "123@chatroom"
+        self.assertEqual(self.notice("李四: 时间: 3点", g), {"time": "14:25", "rec": 7, "sender": "李四", "text": "时间: 3点"})
+        self.assertEqual(self.notice("李四: [图片] ", g)["needs_read"], ["image"])
+        m = self.notice("李四在群聊中@了你", g)
+        self.assertEqual((m["sender"], m["text"], m["needs_read"]), ("李四", "李四在群聊中@了你", ["mention"]))
+        self.assertEqual(self.notice("小助手在群聊中@了所有人", g)["needs_read"], ["mention"])
+        self.assertEqual(self.notice("没有冒号的系统消息", g), {"time": "14:25", "rec": 7, "text": "没有冒号的系统消息"})
+        self.assertNotIn("needs_read", self.notice("李四在群聊中@了你"))            # 私聊不算 @
 
     def test_parse_badge(self):
         self.assertIsNone(server.parse_badge(""))                                   # 没在运行

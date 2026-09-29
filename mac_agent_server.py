@@ -87,6 +87,9 @@ PENDING_DIR = os.path.expanduser("~/.cache/wx-send/pending")   # 待处理消息
 PEEK_DIR = os.path.expanduser("~/.cache/wx-send/peek")   # peek 的状态：新通知从哪算起、角标基线、上次超时提醒
 CD_EPOCH = 978307200   # 通知数据库的时间从 2001-01-01 UTC 起算
 RECALL = re.compile(r'^(["“].+["”]|对方) ?撤回了一条消息$')   # 对方的撤回提示；自己的「你撤回了一条消息」不算
+MENTION = re.compile(r"^(.+?)在群聊中@了(你|所有人)$", re.S)   # 群里被 @ 时通知只有这句，看不到内容
+GROUP_TEXT = re.compile(r"^([^:：\n]{1,40}): (.*)$", re.S)     # 群聊通知正文：「发送人: 内容」
+TRUNCATE_AT = 196   # 通知正文最多 200 字节，到这个长度就可能被截断了
 
 
 def _notify_dbs():
@@ -515,8 +518,8 @@ def parse_notification(data, when) -> dict:
             "time": time.strftime("%Y-%m-%dT%H:%M:%S", time.localtime(when))}
 
 
-def read_notifications(bundle, since) -> list:
-    """这个微信在 since（Unix 时间）之后送达的通知，从旧到新；数据库都打不开时抛 OSError。"""
+def read_notifications(bundle, cursor=None, since=None) -> dict:
+    """这个微信 rec_id > cursor（给了 since 就按送达时间 > since）的通知，另带取到的最大 rec_id 和现存的最小、最大 rec_id。"""
     errors = []
     for path in NOTIFY_DBS:
         if not os.path.exists(path):
@@ -524,23 +527,51 @@ def read_notifications(bundle, since) -> list:
         try:
             con = sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=2)
             try:
-                rows = con.execute(
-                    "SELECT r.data, r.delivered_date FROM record r JOIN app a ON a.app_id = r.app_id"
-                    " WHERE a.identifier = ? AND r.delivered_date > ? ORDER BY r.delivered_date",
-                    (bundle.lower(), since - CD_EPOCH)).fetchall()
+                where = " FROM record r JOIN app a ON a.app_id = r.app_id WHERE a.identifier = ?"
+                lo, hi = con.execute("SELECT MIN(r.rec_id), MAX(r.rec_id)" + where, (bundle.lower(),)).fetchone()
+                pick = "SELECT r.rec_id, r.data, r.delivered_date" + where
+                if since is not None:
+                    rows = con.execute(pick + " AND r.delivered_date > ? ORDER BY r.rec_id",
+                                       (bundle.lower(), since - CD_EPOCH)).fetchall()
+                elif cursor is not None:
+                    rows = con.execute(pick + " AND r.rec_id > ? ORDER BY r.rec_id", (bundle.lower(), cursor)).fetchall()
+                else:
+                    rows = []
             finally:
                 con.close()
         except sqlite3.Error as e:
             errors.append(f"{path}：{e}")
             continue
-        out = []
-        for data, t in rows:
+        items = []
+        for rec, data, t in rows:
             try:
-                out.append(parse_notification(data, t + CD_EPOCH))
-            except Exception:   # 一条坏记录不能拖垮整个 peek
+                items.append(dict(parse_notification(data, t + CD_EPOCH), rec=rec))
+            except Exception:   # 一条坏记录不能拖垮整批
                 continue
-        return out
+        return {"items": items, "last": rows[-1][0] if rows else None, "lo": lo, "hi": hi}
     raise OSError("打不开通知数据库：" + ("；".join(errors) or "没找到"))
+
+
+def notice_message(n) -> dict:
+    """一条通知 → 一条待处理消息：群聊拆出发送人，通知里看不全的（图片、可能被截断、被 @）标 needs_read。"""
+    text, item, needs = n["preview"], {"time": n["time"][11:16], "rec": n["rec"]}, []
+    if n["id"].endswith("@chatroom"):
+        m = MENTION.match(text)
+        if m:
+            item["sender"] = m.group(1)
+            needs.append("mention")
+        else:
+            m = GROUP_TEXT.match(text)
+            if m:
+                item["sender"], text = m.group(1), m.group(2)
+    if text.strip() == "[图片]":
+        needs.append("image")
+    if len(n["preview"].encode()) >= TRUNCATE_AT:
+        needs.append("truncated")
+    item["text"] = text
+    if needs:
+        item["needs_read"] = needs
+    return item
 
 
 def parse_badge(out) -> Optional[int]:
@@ -701,7 +732,7 @@ def a_wechat_peek(account):
     with peek_lock:
         st = load_peek(account) or {"since": now, "badge_base": badge or 0, "reminded": 0}   # 第一次：历史不算新
         try:
-            result["new"] = read_notifications(bundle, st["since"])[-50:]
+            result["new"] = read_notifications(bundle, since=st["since"])["items"][-50:]
         except OSError as e:
             result["notify_error"] = str(e)
         if result["new"]:
