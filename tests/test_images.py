@@ -2,8 +2,10 @@ import base64
 import http.client
 import json
 import os
+import plistlib
 import shutil
 import socket
+import sqlite3
 import struct
 import subprocess
 import sys
@@ -14,6 +16,7 @@ import types
 import unittest
 import zlib
 from http.server import ThreadingHTTPServer
+from unittest import mock
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, ROOT)
@@ -30,6 +33,39 @@ def png(w=2, h=1):
     raw = b"".join(b"\x00" + b"\xff\x00\x00" * w for _ in range(h))
     return (b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", struct.pack(">IIBBBBB", w, h, 8, 2, 0, 0, 0))
             + chunk(b"IDAT", zlib.compress(raw)) + chunk(b"IEND", b""))
+
+
+def notif_blob(title, body, chatname):
+    """按微信通知的真实结构造一条 record.data：usda 是 NSKeyedArchiver 归档的 {chatname, unique_id}。"""
+    U = plistlib.UID
+    usda = plistlib.dumps({"$archiver": "NSKeyedArchiver", "$version": 100000, "$top": {"root": U(1)},
+                           "$objects": ["$null", {"NS.keys": [U(2), U(3)], "NS.objects": [U(4), U(5)], "$class": U(6)},
+                                        "chatname", "unique_id", chatname, chatname + "_1790000000_1",
+                                        {"$classname": "NSDictionary", "$classes": ["NSDictionary", "NSObject"]}]},
+                          fmt=plistlib.FMT_BINARY)
+    req = {"body": body, "usda": usda, "iden": "x"}
+    if title is not None:
+        req["titl"] = title
+    return plistlib.dumps({"req": req}, fmt=plistlib.FMT_BINARY)
+
+
+def make_notify_db(path):
+    con = sqlite3.connect(path)
+    con.executescript(
+        "CREATE TABLE app (app_id INTEGER PRIMARY KEY, identifier VARCHAR);"
+        "CREATE TABLE record (rec_id INTEGER PRIMARY KEY, app_id INTEGER, uuid BLOB, data BLOB, request_date REAL,"
+        " request_last_date REAL, delivered_date REAL, presented Bool, style INTEGER, snooze_fire_date REAL);"
+        "INSERT INTO app VALUES (1, 'com.test.wechat'), (2, 'com.test.other');")
+    con.commit()
+    con.close()
+
+
+def add_notif(path, when, title="张三", body="在吗", chatname="wxid_zs", app_id=1):
+    con = sqlite3.connect(path)
+    con.execute("INSERT INTO record (app_id, data, delivered_date) VALUES (?, ?, ?)",
+                (app_id, notif_blob(title, body, chatname), when - 978307200))
+    con.commit()
+    con.close()
 
 
 class OutboxTest(unittest.TestCase):
@@ -118,6 +154,81 @@ class OutboxTest(unittest.TestCase):
         self.assertEqual(file, "p.jpg")
         with open(os.path.join(server.OUTBOX, file), "rb") as f:
             self.assertEqual(server.image_kind(f.read()), "jpg")
+
+
+class NotifyTest(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.tmp)
+        self.db = os.path.join(self.tmp, "db")
+        make_notify_db(self.db)
+        self.addCleanup(setattr, server, "NOTIFY_DBS", server.NOTIFY_DBS)
+        server.NOTIFY_DBS = [os.path.join(self.tmp, "missing"), self.db]
+
+    def test_reads_after_since_for_this_app_only(self):
+        add_notif(self.db, 1000, body="旧的")
+        add_notif(self.db, 2000, title="张三", body="在吗", chatname="wxid_zs")
+        add_notif(self.db, 2001, title="别的 App", app_id=2)
+        add_notif(self.db, 3000, title=None, body="你收到了一条消息", chatname="custom_id7")
+        got = server.read_notifications("com.test.WeChat", 1500)   # bundle ID 大小写不同也要对上
+        self.assertEqual([(n["chat"], n["id"], n["preview"]) for n in got],
+                         [("张三", "wxid_zs", "在吗"), ("", "custom_id7", "你收到了一条消息")])
+        self.assertEqual(got[0]["time"], time.strftime("%Y-%m-%dT%H:%M:%S", time.localtime(2000)))
+
+    def test_bad_usda_keeps_title(self):
+        data = plistlib.dumps({"req": {"titl": "张三", "body": "在吗", "usda": b"garbage"}}, fmt=plistlib.FMT_BINARY)
+        self.assertEqual(server.parse_notification(data, 0)["id"], "")
+        self.assertEqual(server.parse_notification(data, 0)["chat"], "张三")
+
+    def test_no_database(self):
+        server.NOTIFY_DBS = [os.path.join(self.tmp, "missing")]
+        with self.assertRaises(OSError):
+            server.read_notifications("com.test.wechat", 0)
+
+    def test_corrupt_database(self):
+        bad = os.path.join(self.tmp, "bad")
+        with open(bad, "wb") as f:
+            f.write(b"not a database" * 100)
+        server.NOTIFY_DBS = [bad]
+        with self.assertRaises(OSError):
+            server.read_notifications("com.test.wechat", 0)
+
+    def test_parse_badge(self):
+        self.assertIsNone(server.parse_badge(""))                                   # 没在运行
+        self.assertEqual(server.parse_badge('"StatusLabel"=[ NULL ] \n'), 0)       # 在运行，从没设过角标
+        self.assertEqual(server.parse_badge('"StatusLabel"={ "label"="" }'), 0)
+        self.assertEqual(server.parse_badge('"StatusLabel"={ "label"="3" }'), 3)
+        self.assertEqual(server.parse_badge('"StatusLabel"={ "label"="99+" }'), 99)
+        self.assertEqual(server.parse_badge('"StatusLabel"={ "label"="•" }'), 1)
+
+
+class BundleTest(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.tmp)
+
+    def app(self, name, bundle):
+        path = os.path.join(self.tmp, name + ".app")
+        os.makedirs(os.path.join(path, "Contents"))
+        with open(os.path.join(path, "Contents", "Info.plist"), "wb") as f:
+            plistlib.dump({"CFBundleIdentifier": bundle}, f)
+        return path
+
+    def test_alias_and_default(self):
+        a, b = self.app("WeChat", "com.tencent.xinWeChat"), self.app("WeChat2", "com.tencent.xinWeChat2")
+        with mock.patch.dict(os.environ, {"WX_ACCOUNTS": f"zhiwuzhu={a}, work={b}"}):
+            self.assertEqual(server.wechat_bundle("work"), "com.tencent.xinWeChat2")
+            with self.assertRaises(ValueError):
+                server.wechat_bundle("nobody")
+            with self.assertRaises(ValueError):
+                server.wechat_bundle(None)          # 配了两个，没指定账号
+        with mock.patch.dict(os.environ, {"WX_ACCOUNTS": f"zhiwuzhu={a}"}):
+            self.assertEqual(server.wechat_bundle(None), "com.tencent.xinWeChat")
+
+    def test_missing_app(self):
+        with mock.patch.dict(os.environ, {"WX_ACCOUNTS": f"x={self.tmp}/Nope.app"}):
+            with self.assertRaises(ValueError):
+                server.wechat_bundle("x")
 
 
 TOKEN = "t" * 16

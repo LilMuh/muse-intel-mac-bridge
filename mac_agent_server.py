@@ -53,7 +53,9 @@ import json
 import logging
 import logging.handlers
 import os
+import plistlib
 import re
+import sqlite3
 import subprocess
 import sys
 import tempfile
@@ -80,6 +82,16 @@ WX_SEND = os.path.expanduser(os.environ.get(
 OUTBOX = os.path.join(os.path.dirname(os.path.abspath(__file__)), "outbox")
 INBOX = os.path.join(os.path.dirname(os.path.abspath(__file__)), "inbox")
 PENDING_DIR = os.path.expanduser("~/.cache/wx-send/pending")   # 待处理消息缓存：unread 读到的，回复或 ack 后才清
+CD_EPOCH = 978307200   # 通知数据库的时间从 2001-01-01 UTC 起算
+
+
+def _notify_dbs():
+    d = subprocess.run(["getconf", "DARWIN_USER_DIR"], capture_output=True, text=True).stdout.strip()
+    return ([os.path.join(d, "com.apple.notificationcenter/db2/db")] if d else []) + [
+        os.path.expanduser("~/Library/Group Containers/group.com.apple.usernoted/db2/db")]   # macOS 15 起在这里
+
+
+NOTIFY_DBS = _notify_dbs()   # 系统通知记录（macOS 14 / 15+），peek 从这里看谁发来了新消息
 LOG_FILE = os.path.expanduser(os.environ.get("BRIDGE_LOG", "~/Library/Logs/mab-bridge.log"))
 IMAGE_MAX = int(float(os.environ.get("WX_IMAGE_MAX_MB", "50")) * 1024 * 1024)   # 防止请求过大撑爆内存，不是微信的限制
 IMAGE_EXTS = ("jpg", "jpeg", "png", "gif", "heic")
@@ -465,6 +477,89 @@ def inbox_file(file):
     if kind is None:
         return data, "application/octet-stream"
     return data, "image/" + ("jpeg" if kind == "jpg" else kind)
+
+
+def parse_notification(data, when) -> dict:
+    """一条通知记录 → 聊天名、对方内部 ID（usda 里的 chatname）、预览、本地时间。"""
+    req = plistlib.loads(data).get("req", {})
+    chat_id = ""
+    try:
+        arc = plistlib.loads(req["usda"])
+        objs = arc["$objects"]
+        root = objs[arc["$top"]["root"].data]
+        info = {objs[k.data]: objs[v.data] for k, v in zip(root["NS.keys"], root["NS.objects"])}
+        chat_id = info.get("chatname") or ""
+    except Exception:   # 归档格式变了也不影响聊天名和预览
+        pass
+    return {"chat": req.get("titl") or "", "id": chat_id, "preview": req.get("body") or "",
+            "time": time.strftime("%Y-%m-%dT%H:%M:%S", time.localtime(when))}
+
+
+def read_notifications(bundle, since) -> list:
+    """这个微信在 since（Unix 时间）之后送达的通知，从旧到新；数据库都打不开时抛 OSError。"""
+    errors = []
+    for path in NOTIFY_DBS:
+        if not os.path.exists(path):
+            continue
+        try:
+            con = sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=2)
+            try:
+                rows = con.execute(
+                    "SELECT r.data, r.delivered_date FROM record r JOIN app a ON a.app_id = r.app_id"
+                    " WHERE a.identifier = ? AND r.delivered_date > ? ORDER BY r.delivered_date",
+                    (bundle.lower(), since - CD_EPOCH)).fetchall()
+            finally:
+                con.close()
+        except sqlite3.Error as e:
+            errors.append(f"{path}：{e}")
+            continue
+        return [parse_notification(data, t + CD_EPOCH) for data, t in rows]
+    raise OSError("打不开通知数据库：" + ("；".join(errors) or "没找到"))
+
+
+def parse_badge(out) -> Optional[int]:
+    """lsappinfo 的输出 → 角标数字；没在运行返回 None，没有角标算 0，有字没数字算 1。"""
+    if "StatusLabel" not in out:
+        return None
+    m = re.search(r'"label"="([^"]*)"', out)
+    if not m or not m.group(1):
+        return 0
+    digits = re.sub(r"\D", "", m.group(1))
+    return int(digits) if digits else 1
+
+
+def read_badge(bundle) -> Optional[int]:
+    """读 Dock 角标，不碰微信。"""
+    try:
+        out = subprocess.run(["lsappinfo", "info", "-only", "StatusLabel", "-app", bundle],
+                             capture_output=True, text=True, timeout=5).stdout
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return parse_badge(out)
+
+
+def wechat_bundle(account) -> str:
+    """账号 → 微信的 bundle ID：按 WX_ACCOUNTS 找 App；没给账号时用唯一配置的、或唯一在运行的微信。"""
+    apps = dict(x.strip().split("=", 1) for x in os.environ.get("WX_ACCOUNTS", "").split(",") if "=" in x)
+    if account:
+        if account not in apps:
+            raise ValueError(f"未知账号：{account}（已配置：{'、'.join(apps) or '无'}）")
+        app = apps[account]
+    elif len(apps) == 1:
+        app = next(iter(apps.values()))
+    elif apps:
+        raise ValueError(f"配置了多个微信账号，请指定 account（{'、'.join(apps)}）")
+    else:
+        pids = subprocess.run(["pgrep", "-x", "WeChat"], capture_output=True, text=True).stdout.split()
+        if len(pids) != 1:
+            raise ValueError("没有或有多个正在运行的微信，请指定 account")
+        cmd = subprocess.run(["ps", "-p", pids[0], "-o", "command="], capture_output=True, text=True).stdout
+        app = cmd.split("/Contents/MacOS/")[0]
+    try:
+        with open(os.path.join(os.path.expanduser(app.strip()), "Contents", "Info.plist"), "rb") as f:
+            return plistlib.load(f)["CFBundleIdentifier"]
+    except (OSError, KeyError, plistlib.InvalidFileException) as e:
+        raise ValueError(f"读不到 {app} 的 bundle ID：{e}")
 
 
 def pending_path(account) -> str:
