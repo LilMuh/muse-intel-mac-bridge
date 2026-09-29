@@ -86,6 +86,7 @@ INBOX = os.path.join(os.path.dirname(os.path.abspath(__file__)), "inbox")
 PENDING_DIR = os.path.expanduser("~/.cache/wx-send/pending")   # 待处理消息缓存：unread 读到的，回复或 ack 后才清
 PEEK_DIR = os.path.expanduser("~/.cache/wx-send/peek")   # peek 的状态：新通知从哪算起、角标基线、上次超时提醒
 CD_EPOCH = 978307200   # 通知数据库的时间从 2001-01-01 UTC 起算
+RECALL = re.compile(r'^(["“].+["”]|对方) ?撤回了一条消息$')   # 对方的撤回提示；自己的「你撤回了一条消息」不算
 
 
 def _notify_dbs():
@@ -335,6 +336,7 @@ def a_wechat_read(p):
     if code != 0:
         return {"ok": False, "code": code, "status": WX_STATUS.get(code, "error"), "output": err or out}
     data = json.loads(out[out.index("{"):])
+    log_recalls(p.get("account"), [(chat, data.get("items", []))])
     return {"ok": True, "code": 0, "status": "ok", **data}
 
 
@@ -342,6 +344,14 @@ def wx_json(code, out, err):
     if code != 0:
         return {"ok": False, "code": code, "status": WX_STATUS.get(code, "error"), "output": err or out}
     return {"ok": True, "code": 0, "status": "ok", **json.loads(out[out.index("{"):])}
+
+
+def log_recalls(account, chats):
+    """读到对方撤回的提示时记一行日志；回不回由 Muse 看聊天决定。chats 是 [(聊天名, 消息列表)]。"""
+    for name, msgs in chats:
+        for m in msgs:
+            if m.get("type") == "message" and RECALL.match(m.get("text", "")):
+                log.info("撤回\t%s\t%s\t%s", account or "default", name, m["text"])
 
 
 def a_wechat_unread(p):
@@ -360,6 +370,7 @@ def a_wechat_unread(p):
     # 要逐个点开聊天、点头像识别发送人，未读多时会很久
     code, out, err = run_wx(args, p.get("account"), env, timeout=1800)
     result = wx_json(code, out, err)
+    log_recalls(p.get("account"), [(c.get("name", ""), c.get("messages", [])) for c in result.get("chats", [])])
     data, new = load_pending(p.get("account")), set()
     if result["ok"] and not p.get("list_only"):
         new = add_pending(data, result.get("chats", []))

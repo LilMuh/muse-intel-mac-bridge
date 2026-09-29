@@ -793,6 +793,25 @@ class LogTest(ServerCase):
         self.assertIn("\t400\t", bad)
         self.assertIn("limit 至少是 1", bad)
 
+    def test_logs_recall_on_read(self):
+        items = [{"type": "message", "text": "\"张三\" 撤回了一条消息"}, {"type": "message", "text": "你撤回了一条消息"},
+                 {"type": "message", "text": "好"}]
+        self.wx_out = json.dumps({"chat": "张三", "items": items})
+        with self.assertLogs("bridge") as cm:
+            _, body = self.jcall("POST", "/wechat/read", {"chat": "张三", "account": "work"})
+            time.sleep(0.2)
+        recalls = [r.getMessage() for r in cm.records if r.getMessage().startswith("撤回")]
+        self.assertEqual(recalls, ['撤回\twork\t张三\t"张三" 撤回了一条消息'])
+        self.assertEqual(body["items"], items)        # 返回内容不变
+
+    def test_logs_recall_on_unread(self):
+        self.wx_out = json.dumps({"chats": [{"name": "李四", "group": False, "messages": [
+            {"type": "message", "text": "对方撤回了一条消息"}]}]})
+        with self.assertLogs("bridge") as cm:
+            self.jcall("POST", "/wechat/unread", {})
+            time.sleep(0.2)
+        self.assertIn("撤回\tdefault\t李四\t对方撤回了一条消息", [r.getMessage() for r in cm.records])
+
     def test_logs_client_gone(self):
         closed = threading.Event()
 
