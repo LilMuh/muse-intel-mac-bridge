@@ -107,6 +107,7 @@ python3 mab.py wechat-unread -a work                       # 读所有未读聊�
 python3 mab.py wechat-pending -a work                      # 还没处理的消息（见下文「待处理缓存」）
 python3 mab.py wechat-unread --images -a work              # 同时把图片下载下来（见下文）
 python3 mab.py wechat-friends --accept -a work             # 通过所有好友申请（见下文）
+python3 mab.py wechat-whois "联系人" -a work               # 查私聊联系人的昵称和微信号
 ```
 
 ## 让 Muse 收发微信（可选）
@@ -357,6 +358,7 @@ python3 mab.py wechat-unread --images -a work
 | POST | `/wechat/unread` | `{"account?","list_only?","max_chats?","max_messages?","images?","max_images?"}` | 读所有未读聊天的新消息，返回里的 `pending` 是所有待处理消息 |
 | POST | `/wechat/pending` | `{"account?"}` | 待处理消息，不碰微信 |
 | POST | `/wechat/ack` | `{"chat","account?","upto_id?"}` | 清掉这个聊天的待处理消息 |
+| POST | `/wechat/whois` | `{"chat","account?"}` | 私聊联系人的昵称和微信号：点对方头像读资料卡，返回 `name`、`wxid` |
 | POST | `/wechat/forget` | `{"chat","account?"}` | 删掉某个聊天的读取记录 |
 | POST | `/wechat/prune` | `{"days?","account?"}` | 删掉 N 天没更新的读取记录 |
 | POST | `/wechat/friends` | `{"account?","accept?"}` | 列出 / 通过好友申请 |

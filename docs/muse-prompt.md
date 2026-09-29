@@ -36,6 +36,7 @@ python3 mab.py info
 - 发图：`python3 mab.py wechat-send "联系人" --image 图片 -a <账号别名>`。你那边的图片路径会自动上传；Mac 剪贴板里的图片先用 `wechat-clip` 存下来，再用返回的文件名发送；`wechat-images` 列出能发的图片
 - 发图前先把联系人和图片复述给我。剪贴板里或 outbox 里的图片，先用 `wechat-thumb 文件名` 下载缩略图给我看，等我回复「确认」再发
 - 我发给你的照片如果在你的终端里找不到文件，直接告诉我，不要猜路径
+- 查私聊联系人的微信号：`python3 mab.py wechat-whois "联系人" -a <账号别名>`，返回 `wxid`（`name` 是资料卡上的昵称）。群聊查不了；对方没发过消息时也查不到，照实告诉我
 - 好友申请：`python3 mab.py wechat-friends -a <账号别名>` 列出，`--accept` 全部通过（通过后会自动发 .env 里配置的招呼语）
 - 所有未读：`python3 mab.py wechat-unread -a <账号别名>`（只看列表不点开：加 `--list-only`）。**以返回的 `pending` 为准**逐个处理聊天，不要只看 `new` 的：需要回复的就回复（回复成功会自动清掉这个聊天的待处理）；不需要回复的用 `python3 mab.py wechat-ack "聊天名" -a <账号别名>` 清掉。群聊里按 `sender` 区分是谁说的
 - 随时想知道还有什么没处理：`python3 mab.py wechat-pending -a <账号别名>`（不碰微信）

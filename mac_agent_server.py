@@ -17,6 +17,7 @@ muse-intel-mac-bridge · Mac 端服务
   POST /wechat/send   {"to":"联系人","text":"消息","account":"work","dry_run":false}
   POST /wechat/read   {"chat":"联系人","limit":20,"account":"work","images":false}
   POST /wechat/unread {"account":"work","list_only":false,"images":false}   读所有未读聊天的新消息；images=true 时顺便取图
+  POST /wechat/whois  {"chat":"联系人","account":"work"}      私聊联系人的昵称和微信号
   POST /wechat/forget {"chat":"联系人","account":"work"}      删某个聊天的读取进度
   POST /wechat/prune  {"days":3,"account":"work"}             删 N 天没更新的读取进度
   POST /wechat/friends {"account":"work","accept":false}      列出（accept=true 时通过）好友申请
@@ -364,6 +365,10 @@ def a_wechat_ack(p):
     return {"ok": True, "acked": n}
 
 
+def a_wechat_whois(p):
+    return wx_json(*run_wx(["--whois", text_arg(p, "chat")], p.get("account")))
+
+
 def a_wechat_forget(p):
     return wx_json(*run_wx(["--forget", text_arg(p, "chat")], p.get("account")))
 
@@ -552,7 +557,7 @@ ACTIONS = {
     "click": a_click, "move": a_move, "drag": a_drag,
     "scroll": a_scroll, "type": a_type, "key": a_key,
     "wechat/send": a_wechat_send, "wechat/read": a_wechat_read,
-    "wechat/unread": a_wechat_unread, "wechat/forget": a_wechat_forget, "wechat/prune": a_wechat_prune,
+    "wechat/unread": a_wechat_unread, "wechat/whois": a_wechat_whois, "wechat/forget": a_wechat_forget, "wechat/prune": a_wechat_prune,
     "wechat/friends": a_wechat_friends, "wechat/pending": a_wechat_pending, "wechat/ack": a_wechat_ack,
     "wechat/image/upload": a_wechat_image_upload, "wechat/image/clipboard": a_wechat_image_clipboard,
 }

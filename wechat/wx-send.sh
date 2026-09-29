@@ -7,6 +7,7 @@
 #   ./wx-send.sh -a work --image "联系人" 图片路径      发一张图片（粘贴后核对，再发送）
 #   ./wx-send.sh -a work --read "联系人" [条数]         读取聊天记录（JSON，默认最近 20 条，不够时往上翻着读）
 #   ./wx-send.sh -a work --unread [--list-only]          读所有未读聊天的新消息（JSON；免打扰的只读 WX_MUTED_ALLOW 里的群）
+#   ./wx-send.sh -a work --whois "联系人"               查私聊联系人的昵称和微信号（点对方头像读资料卡）
 #   ./wx-send.sh -a work --friends [--accept]            列出（加 --accept 则通过）等待验证的好友申请；通过后发 WX_FRIEND_GREETING
 #   ./wx-send.sh -a work --forget "联系人"               删掉某个聊天的读取进度（下次按「N条未读」重新读）
 #   ./wx-send.sh -a work --prune [天数]                  删掉 N 天（默认 3 天）没更新过的读取进度；--unread 每天会自动清一次
@@ -1753,7 +1754,42 @@ final class Session {
         }
     }
 
-    /// 读取聊天记录里当前加载出来的消息（最多 limit 条），JSON 输出；WX_IMAGES=1 时顺便取图
+    /// 私聊里从最新往上找对方发的消息，点他的头像读出昵称和微信号，JSON 输出
+    func whois(_ contact: String) throws {
+        var notes: [String] = []
+        try openChat(contact, &notes)
+        if isGroupChat() { throw fail(4, "IS_GROUP", "「\(contact)」是群聊，只能查私聊联系人的微信号") }
+        guard let list = axMessageList(), let box = axFrame(list) else { throw fail(5, "NO_AX", "AX 读不到聊天记录") }
+        _ = waitUntil(1, 0.1) { !visibleRows(list).isEmpty }
+        scrollListToBottom(list)
+        var tried: [AXUIElement] = []   // 点过头像的行；头像没露出来的行翻页后再试
+        var top: AXUIElement?, stalls = 0
+        while true {
+            let rows = visibleRows(list)
+            for row in rows.reversed() where row.msg.type == "message" && !tried.contains(where: { CFEqual($0, row.el) }) {
+                let pt = CGPoint(x: row.frame.minX + 38, y: row.frame.minY + 28)   // 私聊里对方的头像在左边
+                guard box.contains(pt) else { continue }
+                tried.append(row.el)
+                guard let c = try probeAvatar(pt, row.raw, box) else { continue }
+                if c.wxid.isEmpty { throw fail(4, "NO_WXID", "「\(c.name)」的资料卡上没有微信号") }
+                let out: [String: Any] = ["chat": contact, "name": c.name, "wxid": c.wxid, "notes": notes]
+                let data = try JSONSerialization.data(withJSONObject: out, options: [.sortedKeys])
+                say(String(data: data, encoding: .utf8)!)
+                return
+            }
+            // 首行没变就是没翻动；等微信加载更早的消息再试一次，还是没变就是到顶了
+            if let t = top, let f = rows.first, CFEqual(t, f.el) {
+                stalls += 1
+                if stalls > 1 { throw fail(4, "NO_OTHER", "「\(contact)」的聊天里找不到对方发的消息，没法点他的头像") }
+                usleep(800_000)
+            } else { stalls = 0 }
+            top = rows.first?.el
+            try guardFront()
+            scrollList(list, Int32(box.height * 0.7))
+        }
+    }
+
+    /// 从底部往上翻着读聊天记录（最多 limit 条），JSON 输出；WX_IMAGES=1 时顺便取图
     func readChat(_ contact: String, _ limit: Int) throws {
         var notes: [String] = []
         try openChat(contact, &notes)
@@ -2028,8 +2064,9 @@ func run(_ args: [String]) -> Int32 {
             else { try session.printUnreadDetails(allow, Int(envD("WX_UNREAD_MAX_CHATS", 20)), Int(envD("WX_UNREAD_MAX_MSGS", 50))) }
             return 0
         }
-        if mode == "read" {
-            guard args.count == 5, let n = Int(args[4]), n > 0 else { eprint("内部参数错误"); return 64 }
+        if mode == "read" || mode == "whois" {
+            let n = mode == "whois" ? 1 : args.count == 5 ? Int(args[4]) ?? 0 : 0
+            guard args.count >= 4, n > 0 else { eprint("内部参数错误"); return 64 }
             let lockFd = try acquireLock()
             defer { close(lockFd) }
             let clip = ClipboardBackup()
@@ -2039,7 +2076,7 @@ func run(_ args: [String]) -> Int32 {
                 clip.restore()
                 if let m = mouse { moveMouse(m) }
             }
-            do { try session.readChat(args[3], n) } catch let e as WXError {
+            do { if mode == "whois" { try session.whois(args[3]) } else { try session.readChat(args[3], n) } } catch let e as WXError {
                 if session.inSearch && session.isFront() { key(K_ESC) }
                 throw e
             }
@@ -2173,6 +2210,7 @@ case "$1" in
   --dump)  exec "$BIN" dump "$NAME" "$APP" ;;
   --batch) [[ $# -eq 2 ]] || usage; exec "$BIN" batch "$NAME" "$APP" "$2" ;;
   --read)  [[ $# -ge 2 && $# -le 3 ]] || usage; exec "$BIN" read "$NAME" "$APP" "$2" "${3:-20}" ;;
+  --whois) [[ $# -eq 2 ]] || usage; exec "$BIN" whois "$NAME" "$APP" "$2" ;;
   --friends) exec "$BIN" friends "$NAME" "$APP" "$([[ "${2:-}" == "--accept" ]] && echo accept || echo list)" ;;
   --unread) exec "$BIN" unread "$NAME" "$APP" "$([[ "${2:-}" == "--list-only" ]] && echo list || echo details)" ;;
   --image) [[ $# -eq 3 ]] || usage; exec "$BIN" image "$NAME" "$APP" "$2" "$3" ;;

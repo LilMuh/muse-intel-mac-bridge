@@ -21,6 +21,7 @@ muse-intel-mac-bridge · 客户端（在 agent 的 Linux VM 里运行，只依�
   python3 mab.py wechat-unread [--list-only] [--images] [-a work]   # --images：取图片，下载到 ./wechat-images，消息里加 local_path
   python3 mab.py wechat-pending [-a work]           # 待处理消息（unread 读到、还没回复或 ack 的），不碰微信
   python3 mab.py wechat-ack "联系人" [--upto ID] [-a work]   # 不需要回复的聊天，手动清掉待处理
+  python3 mab.py wechat-whois "联系人" [-a work]   # 私聊联系人的昵称和微信号
   python3 mab.py wechat-forget "联系人" [-a work]   # 只重置 wechat-unread 的读取进度
   python3 mab.py wechat-prune [--days 3] [-a work]
   python3 mab.py wechat-friends [--accept] [-a work]
@@ -145,6 +146,7 @@ def main():
         sp.add_argument("--images", action="store_true", help="顺便取图片，下载到 --save-dir")
         sp.add_argument("--max-images", type=int, default=10)
         sp.add_argument("--save-dir", default="wechat-images")
+    ww = sub.add_parser("wechat-whois"); ww.add_argument("chat"); ww.add_argument("-a", "--account")
     wf = sub.add_parser("wechat-forget"); wf.add_argument("chat"); wf.add_argument("-a", "--account")
     wp = sub.add_parser("wechat-prune"); wp.add_argument("--days", type=int, default=3); wp.add_argument("-a", "--account")
     wfr = sub.add_parser("wechat-friends"); wfr.add_argument("--accept", action="store_true"); wfr.add_argument("-a", "--account")
@@ -209,6 +211,8 @@ def main():
         if a.upto is not None:
             p["upto_id"] = a.upto
         post("/wechat/ack", p)
+    elif a.cmd == "wechat-whois":
+        post("/wechat/whois", {"chat": a.chat, "account": a.account}, max(TIMEOUT, 320))
     elif a.cmd == "wechat-forget":
         post("/wechat/forget", {"chat": a.chat, "account": a.account})
     elif a.cmd == "wechat-prune":
