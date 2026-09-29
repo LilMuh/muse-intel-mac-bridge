@@ -1754,6 +1754,17 @@ final class Session {
         }
     }
 
+    /// send / read / whois 做完切回文件传输助手：停在客户的聊天上，他紧接着回的消息会直接变成已读，也不发通知
+    func park() {
+        guard isFront() else { return }   // 被切走了就不抢焦点
+        var n: [String] = []
+        do { try openChat(HOME_CHAT, &n) } catch {
+            if inSearch && isFront() { key(K_ESC) }
+            inSearch = false
+            eprint("⚠️ 没能切回「\(HOME_CHAT)」：\((error as? WXError)?.msg ?? "\(error)")")
+        }
+    }
+
     /// 私聊里从最新往上找对方发的消息，点他的头像读出昵称和微信号，JSON 输出
     func whois(_ contact: String) throws {
         var notes: [String] = []
@@ -2076,6 +2087,7 @@ func run(_ args: [String]) -> Int32 {
                 clip.restore()
                 if let m = mouse { moveMouse(m) }
             }
+            defer { session.park() }   // 后声明的先执行：切回时剪贴板还没恢复
             do { if mode == "whois" { try session.whois(args[3]) } else { try session.readChat(args[3], n) } } catch let e as WXError {
                 if session.inSearch && session.isFront() { key(K_ESC) }
                 throw e
@@ -2140,6 +2152,7 @@ func run(_ args: [String]) -> Int32 {
                 if e.code == 5 || e.code == 6 { break }   // 环境问题或被打断：后面的也不发了
             }
         }
+        if !DRY_RUN { session.park() }   // 试运行要让人看到输入框里的内容，不切走
         return worst
     } catch let e as WXError {
         writeLog(account, "-", "FAILED:" + e.tag, "0", e.msg, "")
