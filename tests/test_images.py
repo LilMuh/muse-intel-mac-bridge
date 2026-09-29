@@ -565,33 +565,36 @@ class PeekTest(ServerCase):
         self.assertEqual(status, 200, body)
         return body
 
-    def state(self, **kw):
-        st = {"since": time.time() - 100, "badge_base": 0, "reminded": 0}
-        st.update(kw)
-        server.save_peek(None, st)
-
-    def unread(self, **p):
-        self.wx_out = json.dumps({"chats": []})
-        return self.jcall("POST", "/wechat/unread", p)
-
     def test_first_peek_ignores_history(self):
         add_notif(self.db, time.time() - 60)
         self.badge = 3
         body = self.peek()
-        self.assertEqual((body["wake"], body["reasons"], body["new"], body["badge"], body["badge_base"]),
-                         (False, [], [], 3, 3))
+        self.assertEqual((body["wake"], body["reasons"], body["new"], body["pending"], body["badge"]),
+                         (False, [], [], 0, 3))
+        self.assertNotIn("badge_base", body)
+        self.assertNotIn("incomplete", body)
 
-    def test_unread_ok_even_if_bundle_lookup_crashes(self):
-        def broken(account):
-            raise RuntimeError("Info.plist 坏了")
-        server.wechat_bundle = broken
-        status, body = self.unread()
-        self.assertEqual((status, body["ok"]), (200, True))
-
-    def test_badge_none_when_not_running(self):
-        self.badge = None
+    def test_new_message_wakes_once(self):
+        self.peek()
+        add_notif(self.db, time.time(), title="张三", body="[图片] ", chatname="wxid_zs")
         body = self.peek()
-        self.assertEqual((body["badge"], body["wake"]), (None, False))
+        self.assertEqual((body["reasons"], body["pending"]), (["new"], 1))
+        self.assertEqual(body["new"], [{"chat": "张三", "id": 1, "text": "[图片] ", "needs_read": ["image"]}])
+        body = self.peek()
+        self.assertEqual((body["wake"], body["new"], body["pending"]), (False, [], 1))   # 已经收过了
+
+    def test_badge_is_only_informational(self):
+        self.peek()
+        self.badge = 9
+        self.assertFalse(self.peek()["wake"])
+        self.badge = None
+        self.assertIsNone(self.peek()["badge"])
+
+    def test_notify_db_missing(self):
+        server.NOTIFY_DBS = [os.path.join(self.tmp, "nope")]
+        body = self.peek()
+        self.assertIn("打不开通知数据库", body["notify_error"])
+        self.assertEqual((body["wake"], body["new"]), (False, []))
 
     def test_stale_reminds_once_per_interval(self):
         server.save_pending(None, {"next_id": 3, "chats": {
@@ -617,17 +620,11 @@ class PeekTest(ServerCase):
         with mock.patch.dict(os.environ, {"WX_PEEK_STALE_MIN": "0"}):
             self.assertEqual(self.jcall("GET", "/wechat/peek")[0], 400)
 
-    def test_notify_db_missing(self):
-        server.NOTIFY_DBS = [os.path.join(self.tmp, "nope")]
-        body = self.peek()
-        self.assertIn("打不开通知数据库", body["notify_error"])
-        self.assertEqual((body["wake"], body["badge"]), (False, 0))
-
     def test_account_state_is_separate(self):
         seen = []
         server.wechat_bundle = lambda account: seen.append(account) or "com.test.WeChat"
         self.peek("work")
-        self.assertEqual(seen, ["work"])
+        self.assertEqual(set(seen), {"work"})
         self.assertTrue(os.path.isfile(os.path.join(server.PEEK_DIR, "work.json")))
         self.assertFalse(os.path.isfile(os.path.join(server.PEEK_DIR, "default.json")))
 
@@ -792,8 +789,8 @@ class MabTest(ServerCase):
         return path
 
     def test_peek(self):
-        add_notif(self.db, time.time() + 1)
-        server.save_peek("work", {"since": time.time() - 10, "badge_base": 0, "reminded": 0})
+        server.save_peek("work", {"cursor": 0, "reminded": 0})
+        add_notif(self.db, time.time())
         r = self.mab("wechat-peek", "-a", "work")
         self.assertEqual(r.returncode, 0, r.stderr)
         body = json.loads(r.stdout)

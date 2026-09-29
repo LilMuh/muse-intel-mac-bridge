@@ -21,9 +21,9 @@ muse-intel-mac-bridge · Mac 端服务
   POST /wechat/forget {"chat":"联系人","account":"work"}      删某个聊天的读取进度
   POST /wechat/prune  {"days":3,"account":"work"}             删 N 天没更新的读取进度
   POST /wechat/friends {"account":"work","accept":false}      列出（accept=true 时通过）好友申请
-  POST /wechat/pending {"account":"work"}                     待处理消息（unread 读到、还没回复或 ack 的），不碰微信
+  POST /wechat/pending {"account":"work"}                     先从系统通知收新消息，再返回待处理（还没回复或 ack 的），不碰微信
   POST /wechat/ack    {"chat":"联系人","account":"work","upto_id":12}  清掉这个聊天的待处理消息（回复成功时会自动清）
-  GET  /wechat/peek?account=work                              有没有要处理的（新通知、角标、超时的待处理），不碰微信、不排队
+  GET  /wechat/peek?account=work                              收新消息进待处理，有新消息或待处理超时就 wake，不碰微信、不排队
   POST /wechat/send   {"to":"联系人","image":"a.jpg"}          发 outbox 里的一张图片（text 和 image 二选一）
   POST /wechat/image/upload    {"name":"a.jpg","data":"<base64>"}  图片存进 outbox
   POST /wechat/image/clipboard {"name":"x.png"}                  Mac 剪贴板里的图片存进 outbox
@@ -785,31 +785,23 @@ def stale_chats(data, cutoff) -> list:
 
 
 def a_wechat_peek(account):
-    """不碰微信，看有没有要处理的：新通知、角标超过基线、待处理消息超时没人管。"""
-    bundle, now, minutes = wechat_bundle(account), time.time(), stale_minutes()
-    badge = read_badge(bundle)
-    result, reasons = {"ok": True, "new": [], "badge": badge}, []
+    """不碰微信：先把新通知收进待处理，再看要不要唤醒 worker（有新消息，或待处理超时没人管）。"""
+    minutes, now = stale_minutes(), time.time()
+    got = ingest(account)
+    result = {"ok": True, "badge": read_badge(wechat_bundle(account))}
+    result.update({k: got[k] for k in ("note", "notify_error") if k in got})
+    reasons = ["new"] if got["new"] else []
     with cache_lock:
-        st = load_peek(account) or {"since": now, "badge_base": badge or 0, "reminded": 0}   # 第一次：历史不算新
-        try:
-            result["new"] = read_notifications(bundle, since=st["since"])["items"][-50:]
-        except OSError as e:
-            result["notify_error"] = str(e)
-        if result["new"]:
-            reasons.append("new")
-        if badge is not None and badge < st["badge_base"]:
-            st["badge_base"] = badge          # 在手机上读掉了几条
-        elif badge is not None and badge > st["badge_base"]:
-            reasons.append("badge")
         data = load_pending(account)
         result["stale"] = stale_chats(data, time.strftime("%Y-%m-%dT%H:%M:%S", time.localtime(now - minutes * 60)))
-        late = [r for r, on in (("stale", result["stale"]), ("incomplete", st.get("incomplete"))) if on]
-        if late and now - st["reminded"] >= minutes * 60:
-            reasons += late
+        st = load_peek(account) or {"reminded": 0}
+        if result["stale"] and now - st.get("reminded", 0) >= minutes * 60:
+            reasons.append("stale")
             st["reminded"] = now
-        save_peek(account, st)
-    result.update(badge_base=st["badge_base"], pending=sum(len(c["messages"]) for c in data["chats"].values()),
-                  incomplete=bool(st.get("incomplete")), reasons=reasons, wake=bool(reasons))
+            save_peek(account, st)
+    result["new"] = [dict({k: m[k] for k in ("id", "text", "sender", "needs_read") if k in m}, chat=name)
+                     for name, c in data["chats"].items() for m in c["messages"] if m["id"] in got["new"]][-50:]
+    result.update(pending=sum(len(c["messages"]) for c in data["chats"].values()), reasons=reasons, wake=bool(reasons))
     return result
 
 
