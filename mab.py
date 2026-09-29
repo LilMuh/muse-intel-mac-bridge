@@ -21,7 +21,7 @@ muse-intel-mac-bridge · 客户端（在 agent 的 Linux VM 里运行，只依�
   python3 mab.py wechat-unread [--list-only] [--images] [-a work]   # --images：取图片，下载到 ./wechat-images，消息里加 local_path
   python3 mab.py wechat-pending [-a work]           # 待处理消息（unread 读到、还没回复或 ack 的），不碰微信
   python3 mab.py wechat-ack "联系人" [--upto ID] [-a work]   # 不需要回复的聊天，手动清掉待处理
-  python3 mab.py wechat-forget "联系人" [-a work]
+  python3 mab.py wechat-forget "联系人" [-a work]   # 只重置 wechat-unread 的读取进度
   python3 mab.py wechat-prune [--days 3] [-a work]
   python3 mab.py wechat-friends [--accept] [-a work]
   python3 mab.py wechat-upload 图片路径 [--name a.jpg]

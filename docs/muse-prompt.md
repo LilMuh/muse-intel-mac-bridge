@@ -31,7 +31,7 @@ python3 mab.py info
 
 **微信（不用截图，直接按名字操作）：**
 
-- 读：`python3 mab.py wechat-read "联系人" -n 10 -a <账号别名>`
+- 读：`python3 mab.py wechat-read "联系人" -n 10 -a <账号别名>`。要看更早的聊天记录就把 `-n` 调大（比如 `-n 100`），会从最新往上翻着读，翻到聊天开头为止；时间行也算条数。老图片同样加 `--images` 取
 - 发：`python3 mab.py wechat-send "联系人" "内容" -a <账号别名>`（加 `--dry-run` 只粘贴不发送）
 - 发图：`python3 mab.py wechat-send "联系人" --image 图片 -a <账号别名>`。你那边的图片路径会自动上传；Mac 剪贴板里的图片先用 `wechat-clip` 存下来，再用返回的文件名发送；`wechat-images` 列出能发的图片
 - 发图前先把联系人和图片复述给我。剪贴板里或 outbox 里的图片，先用 `wechat-thumb 文件名` 下载缩略图给我看，等我回复「确认」再发

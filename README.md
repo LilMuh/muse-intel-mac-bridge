@@ -238,7 +238,7 @@ python3 mab.py wechat-ack "项目群" -a work          # 清掉这个聊天的�
 
 **管理读取记录：**
 ```bash
-python3 mab.py wechat-forget "张三" -a work     # 删掉某个聊天的读取记录，下次按「N条未读」重新读
+python3 mab.py wechat-forget "张三" -a work     # 删掉某个聊天的读取记录，下次按「N条未读」重新读（只影响 wechat-unread；wechat-read 没有读取记录）
 python3 mab.py wechat-prune --days 3 -a work    # 删掉 3 天没更新的读取记录
 ```
 
@@ -333,7 +333,7 @@ python3 mab.py wechat-unread --images -a work
 
 ### 限制
 
-- `wechat-read` 只能读到聊天窗口里当前加载出来的消息（通常是最近十几条），也分不出每条是谁发的。
+- `wechat-read` 从最新往上一页页翻着读，`-n` 条数不设上限（含时间行），翻到顶就停；分不出每条是谁发的。
 - 同一时间只处理一个请求，其余的排队等待（最多 180 秒）。
 - 内置防风控：同一账号两次发送至少间隔 3 秒（间隔不够会自动等待），每天最多 500 条（`WX_DAILY_MAX` 可调）。
 - 偶尔会出现点击搜索结果后聊天没有切换过去的情况，这时会返回 `verify_failed`，不会粘贴也不会发送，重试即可。

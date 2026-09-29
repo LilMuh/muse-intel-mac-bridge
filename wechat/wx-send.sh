@@ -5,7 +5,7 @@
 #   ./wx-send.sh -a work "联系人或群名" "消息内容"     发送
 #   ./wx-send.sh -a work --batch 名单.tsv            批量发送（每行：联系人<Tab>消息，消息里的 \n 表示换行）
 #   ./wx-send.sh -a work --image "联系人" 图片路径      发一张图片（粘贴后核对，再发送）
-#   ./wx-send.sh -a work --read "联系人" [条数]         读取聊天记录（JSON，默认最近 20 条，只含当前加载出来的）
+#   ./wx-send.sh -a work --read "联系人" [条数]         读取聊天记录（JSON，默认最近 20 条，不够时往上翻着读）
 #   ./wx-send.sh -a work --unread [--list-only]          读所有未读聊天的新消息（JSON；免打扰的只读 WX_MUTED_ALLOW 里的群）
 #   ./wx-send.sh -a work --friends [--accept]            列出（加 --accept 则通过）等待验证的好友申请；通过后发 WX_FRIEND_GREETING
 #   ./wx-send.sh -a work --forget "联系人"               删掉某个聊天的读取进度（下次按「N条未读」重新读）
@@ -1210,12 +1210,15 @@ final class Session {
         scrollListToBottom(list)
         var hi = all.count
         var seen: [(el: AXUIElement, i: Int)] = []   // 上一页每一行的元素和下标：同名的「图片」行只能靠元素区分
-        for _ in 0..<15 {
+        var last = Int.max
+        while true {
             let rows = visibleRows(list)
             let known = rows.map { r in seen.first { CFEqual($0.el, r.el) }?.i }
             guard let j = alignPage(all, rows.map { $0.msg.plain }, hi: hi, known: known) else {
                 throw fail(4, "ALIGN", "滚动后对不上消息的位置，更早的消息没有处理")
             }
+            if j >= last { throw fail(4, "ALIGN", "往上翻不动了，更早的消息没有处理") }
+            last = j
             for (k, row) in rows.enumerated().reversed() where j + k >= start {
                 try act(j + k, row, &all)
             }
@@ -1754,16 +1757,31 @@ final class Session {
     func readChat(_ contact: String, _ limit: Int) throws {
         var notes: [String] = []
         try openChat(contact, &notes)
-        guard let list = axMessageList() else { throw fail(5, "NO_AX", "AX 读不到聊天记录") }
-        if IMAGES { scrollListToBottom(list) }   // 取图要从底部逐页对位，先让读到的就是最新的一段
-        var items: [Msg] = []
-        for row in axChildren(list) {
-            // 屏幕外的消息是没有内容的占位元素，读不到
-            guard var t = axStr(row, kAXTitleAttribute), !t.isEmpty else { continue }
-            if t.hasSuffix(" ") { t.removeLast() }
-            let h = axFrame(row)?.height ?? 0
-            let isTime = h < 50 && t.range(of: MSG_TIME, options: .regularExpression) != nil
-            items.append(Msg(type: isTime ? "time" : "message", text: t))
+        guard let list = axMessageList(), let box = axFrame(list) else { throw fail(5, "NO_AX", "AX 读不到聊天记录") }
+        _ = waitUntil(1, 0.1) { !visibleRows(list).isEmpty }
+        scrollListToBottom(list)
+        // 屏幕外的消息是没有内容的占位元素，读不到，只能从底部一页页往上翻着读
+        var rows = visibleRows(list)
+        var items = rows.map { $0.msg }
+        var stalls = 0
+        while items.count < limit {
+            try guardFront()
+            scrollList(list, Int32(box.height * 0.7))
+            let page = visibleRows(list)
+            let known = page.map { r in rows.contains { CFEqual($0.el, r.el) } }
+            guard let merged = prependRows(items, page.map { $0.msg }, known: known) else {
+                notes.append("往上翻时对不上消息的位置，更早的消息没读到"); break
+            }
+            if merged.count == items.count {
+                // 翻到已加载的顶部时微信会再加载一批更早的，等一下再翻一次；还是没有新行就是到顶了
+                stalls += 1
+                if stalls > 1 { break }
+                usleep(800_000)
+                continue
+            }
+            stalls = 0
+            items = merged
+            rows = page
         }
         if IMAGES {
             imagesTaken = 0; imagesSkipped = 0

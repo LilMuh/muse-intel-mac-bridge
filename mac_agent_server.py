@@ -304,8 +304,8 @@ def image_env(p) -> dict:
 def a_wechat_read(p):
     chat = text_arg(p, "chat")
     limit = int(p.get("limit", 20))
-    if not 1 <= limit <= 200:
-        raise ValueError("limit 需在 1–200 之间")
+    if limit < 1:
+        raise ValueError("limit 至少是 1")
     if p.get("images"):
         prune_inbox(inbox_days())
     # 取图每张要右键复制一次，放宽超时
