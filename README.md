@@ -263,12 +263,14 @@ python3 mab.py wechat-peek -a work
 ```
 
 唤醒理由只有两个：
-- **`new`**：这次收进了新消息。
+- **`new`**：待处理里还有没交给 Muse 的消息（还没被 `wechat-pending` 返回过）。一直唤醒到 Muse 取走为止，某次唤醒被丢掉也不要紧。
 - **`stale`**：待处理消息超过 30 分钟（`WX_PEEK_STALE_MIN`）还没回复或 `ack`，每 30 分钟提醒一次。
 
 `badge` 是 Dock 角标，只作参考，不会触发唤醒。
 
-被唤醒后用 `wechat-pending` 拿全部待处理。收进来的消息比 `wechat-unread` 多几个字段：
+被唤醒后用 `wechat-pending` 拿全部待处理。返回过的消息算「已交给 Muse」：回复成功和 `wechat-ack` 只清已交给 Muse 的，之后才进来、Muse 还没看到的消息会留着。
+
+收进来的消息比 `wechat-unread` 多几个字段：
 - 群聊消息带 `sender`（通知正文是「发送人: 内容」）。
 - 聊天带 `chat_id`（对方的微信内部 ID，不等于资料卡上的微信号；要微信号仍然用 `wechat-whois`）。备注改名后，同一个 `chat_id` 的聊天会整体改成新名字。
 - 通知里看不全的消息带 `needs_read`，要用 `wechat-read "聊天名" -n 条数 --images` 打开读：

@@ -170,33 +170,22 @@ class NotifyTest(unittest.TestCase):
         self.assertEqual(server.parse_notification(data, 0)["id"], "")
         self.assertEqual(server.parse_notification(data, 0)["chat"], "张三")
 
-    def test_reads_after_cursor_for_this_app_only(self):
-        add_notif(self.db, 1000, body="旧的")                                  # rec 1
-        add_notif(self.db, 2000, title="张三", body="在吗", chatname="wxid_zs")   # rec 2
-        add_notif(self.db, 2001, title="别的 App", app_id=2)                    # rec 3
-        add_notif(self.db, 3000, title=None, body="你收到了一条消息", chatname="custom_id7")   # rec 4
-        got = server.read_notifications("com.test.WeChat", cursor=1)          # bundle ID 大小写不同也要对上
-        self.assertEqual([(n["rec"], n["chat"], n["id"], n["preview"]) for n in got["items"]],
-                         [(2, "张三", "wxid_zs", "在吗"), (4, "", "custom_id7", "你收到了一条消息")])
-        self.assertEqual((got["last"], got["lo"], got["hi"]), (4, 1, 4))
-        self.assertEqual(got["items"][0]["time"], time.strftime("%Y-%m-%dT%H:%M:%S", time.localtime(2000)))
-
-    def test_since_and_stats_only(self):
-        add_notif(self.db, 1000)
-        add_notif(self.db, 2000)
-        got = server.read_notifications("com.test.wechat", since=1500)
-        self.assertEqual(([n["rec"] for n in got["items"]], got["last"]), ([2], 2))
-        got = server.read_notifications("com.test.wechat")
-        self.assertEqual((got["items"], got["last"], got["lo"], got["hi"]), ([], None, 1, 2))
+    def test_reads_all_for_this_app(self):
+        add_notif(self.db, 1000, body="一")                                     # rec 1
+        add_notif(self.db, 2001, title="别的 App", app_id=2)                    # rec 2
+        add_notif(self.db, 3000, title="张三", body="二", chatname="wxid_zs")   # rec 3
+        rows = server.read_notifications("com.test.WeChat")                    # bundle ID 大小写不同也要对上
+        self.assertEqual([(r["rec"], r["when"]) for r in rows], [(1, 1000), (3, 3000)])
+        self.assertEqual(server.parse_notification(rows[1]["data"], rows[1]["when"])["preview"], "二")
+        self.assertNotEqual(rows[0]["key"], rows[1]["key"])
 
     def test_empty_app(self):
-        got = server.read_notifications("com.test.wechat", cursor=0)
-        self.assertEqual((got["items"], got["last"], got["lo"], got["hi"]), ([], None, None, None))
+        self.assertEqual(server.read_notifications("com.test.wechat"), [])
 
     def test_no_database(self):
         server.NOTIFY_DBS = [os.path.join(self.tmp, "missing")]
         with self.assertRaises(OSError):
-            server.read_notifications("com.test.wechat", cursor=0)
+            server.read_notifications("com.test.wechat")
 
     def test_corrupt_database(self):
         bad = os.path.join(self.tmp, "bad")
@@ -204,17 +193,7 @@ class NotifyTest(unittest.TestCase):
             f.write(b"not a database" * 100)
         server.NOTIFY_DBS = [bad]
         with self.assertRaises(OSError):
-            server.read_notifications("com.test.wechat", cursor=0)
-
-    def test_bad_record_is_skipped_but_counted(self):
-        add_notif(self.db, 2000, body="好的")
-        con = sqlite3.connect(self.db)
-        con.execute("INSERT INTO record (app_id, data, delivered_date) VALUES (1, ?, ?)", (b"garbage", 2001 - 978307200))
-        con.execute("INSERT INTO record (app_id, data, delivered_date) VALUES (1, NULL, ?)", (2002 - 978307200,))
-        con.commit()
-        con.close()
-        got = server.read_notifications("com.test.wechat", cursor=0)
-        self.assertEqual(([n["preview"] for n in got["items"]], got["last"]), (["好的"], 3))   # 坏记录也算进 last
+            server.read_notifications("com.test.wechat")
 
     def notice(self, body, chat_id="wxid_zs"):
         return server.notice_message({"rec": 7, "chat": "x", "id": chat_id, "preview": body,
@@ -574,14 +553,23 @@ class PeekTest(ServerCase):
         self.assertNotIn("badge_base", body)
         self.assertNotIn("incomplete", body)
 
-    def test_new_message_wakes_once(self):
+    def test_new_message_wakes(self):
         self.peek()
         add_notif(self.db, time.time(), title="张三", body="[图片] ", chatname="wxid_zs")
         body = self.peek()
         self.assertEqual((body["reasons"], body["pending"]), (["new"], 1))
         self.assertEqual(body["new"], [{"chat": "张三", "id": 1, "text": "[图片] ", "needs_read": ["image"]}])
+        self.jcall("POST", "/wechat/pending", {})
         body = self.peek()
-        self.assertEqual((body["wake"], body["new"], body["pending"]), (False, [], 1))   # 已经收过了
+        self.assertEqual((body["wake"], body["new"], body["pending"]), (False, [], 1))   # 已经交给 Muse 了
+
+    def test_new_keeps_waking_until_muse_fetches(self):
+        self.peek()
+        add_notif(self.db, time.time(), title="张三", body="在吗")
+        self.assertEqual(self.peek()["reasons"], ["new"])
+        self.assertEqual(self.peek()["reasons"], ["new"])   # 这次唤醒可能被 hook 丢掉：没交给 Muse 之前一直唤醒
+        self.jcall("POST", "/wechat/pending", {})
+        self.assertFalse(self.peek()["wake"])
 
     def test_badge_is_only_informational(self):
         self.peek()
@@ -598,8 +586,8 @@ class PeekTest(ServerCase):
 
     def test_stale_reminds_once_per_interval(self):
         server.save_pending(None, {"next_id": 3, "chats": {
-            "李四": {"group": False, "messages": [{"id": 1, "text": "x", "added": "2026-01-01T00:00:00"}]},
-            "王五": {"group": False, "messages": [{"id": 2, "text": "y", "added": time.strftime("%Y-%m-%dT%H:%M:%S")}]}}})
+            "李四": {"group": False, "messages": [{"id": 1, "text": "x", "added": "2026-01-01T00:00:00", "shown": True}]},
+            "王五": {"group": False, "messages": [{"id": 2, "text": "y", "added": time.strftime("%Y-%m-%dT%H:%M:%S"), "shown": True}]}}})
         body = self.peek()
         self.assertEqual((body["reasons"], body["pending"]), (["stale"], 2))
         self.assertEqual(body["stale"], [{"chat": "李四", "count": 1, "oldest": "2026-01-01T00:00:00"}])
@@ -663,7 +651,19 @@ class IngestTest(ServerCase):
         add_notif(self.db, time.time() - 60)
         body = self.pending()
         self.assertEqual(body["count"], 0)
-        self.assertEqual(server.load_peek(None), {"cursor": 1, "reminded": 0})
+        st = server.load_peek(None)
+        self.assertEqual((len(st["seen"]), st["reminded"]), (1, 0))
+
+    def test_bad_record_is_skipped_and_not_reread(self):
+        self.pending()
+        add_notif(self.db, time.time(), body="好的")
+        con = sqlite3.connect(self.db)
+        con.execute("INSERT INTO record (app_id, data, delivered_date) VALUES (1, ?, ?)", (b"garbage", time.time() - 978307200))
+        con.execute("INSERT INTO record (app_id, data, delivered_date) VALUES (1, NULL, ?)", (time.time() - 978307200,))
+        con.commit()
+        con.close()
+        self.assertEqual([m["text"] for m in self.pending()["pending"]["张三"]["messages"]], ["好的"])
+        self.assertEqual(len(server.load_peek(None)["seen"]), 3)   # 坏记录也记为收过，不会每次重读
 
     def test_new_private_message(self):
         self.pending()
@@ -709,48 +709,38 @@ class IngestTest(ServerCase):
         add_notif(self.db, time.time() - 200, body="升级前的")
         add_notif(self.db, time.time() - 50, body="升级后的")
         self.assertEqual([m["text"] for m in self.pending()["pending"]["张三"]["messages"]], ["升级后的"])
-        self.assertEqual(server.load_peek(None), {"cursor": 2, "reminded": 5})
-
-    def test_cursor_follows_rows_not_stats(self):
-        server.save_peek(None, {"cursor": 0, "reminded": 0})
-        item = {"rec": 5, "chat": "张三", "id": "wxid_zs", "preview": "在吗", "time": "2026-09-29T14:25:30"}
-        orig = server.read_notifications
-        server.read_notifications = lambda bundle, cursor=None, since=None: {"items": [item], "last": 5, "lo": 1, "hi": 9}
-        self.addCleanup(setattr, server, "read_notifications", orig)
-        self.pending()
-        self.assertEqual(server.load_peek(None)["cursor"], 5)
+        st = server.load_peek(None)
+        self.assertEqual((sorted(st), len(st["seen"]), st["reminded"]), (["reminded", "seen"], 2, 5))
 
     def test_gap_note(self):
-        for _ in range(10):
+        for _ in range(100):
             add_notif(self.db, time.time())
-        con = sqlite3.connect(self.db)
-        con.execute("DELETE FROM record WHERE rec_id <= 8")   # 100 条上限把没读到的挤掉了
-        con.commit()
-        con.close()
-        server.save_peek(None, {"cursor": 5, "reminded": 0})
+        server.save_peek(None, {"seen": ["早就被挤掉的"], "reminded": 0})   # 100 条全是没见过的：中间可能有被挤掉的
         self.assertIn("可能漏了", self.pending()["note"])
+        self.assertNotIn("note", self.pending())
 
-    def test_notify_error_keeps_cache_and_cursor(self):
-        server.save_peek(None, {"cursor": 3, "reminded": 0})
+    def test_notify_error_keeps_state(self):
+        server.save_peek(None, {"seen": ["a"], "reminded": 0})
         server.NOTIFY_DBS = [os.path.join(self.tmp, "nope")]
         body = self.pending()
         self.assertIn("打不开通知数据库", body["notify_error"])
-        self.assertEqual(server.load_peek(None)["cursor"], 3)
+        self.assertEqual(server.load_peek(None)["seen"], ["a"])
 
-    def test_save_failure_keeps_cursor(self):
+    def test_save_failure_keeps_state(self):
         self.pending()
         add_notif(self.db, time.time())
         def broken(account, data):
             raise OSError("磁盘满了")
-        self.addCleanup(setattr, server, "save_pending", server.save_pending)
+        orig = server.save_pending
         server.save_pending = broken
         self.assertEqual(self.jcall("POST", "/wechat/pending", {})[0], 400)
-        self.assertEqual(server.load_peek(None)["cursor"], 0)   # 下次还会重收这一条
+        server.save_pending = orig
+        self.assertEqual(self.pending()["count"], 1)   # 下次还会重收这一条
 
     def test_ingest_and_ack_do_not_overwrite_each_other(self):
         self.pending()
         server.save_pending(None, {"next_id": 2, "chats": {"李四": {"group": False, "messages": [
-            {"id": 1, "text": "x", "added": "2026-09-29T00:00:00"}]}}})
+            {"id": 1, "text": "x", "added": "2026-09-29T00:00:00", "shown": True}]}}})
         add_notif(self.db, time.time(), title="张三", body="在吗")
         acked = []
         orig = server.add_notices
@@ -769,6 +759,36 @@ class IngestTest(ServerCase):
                 break
             time.sleep(0.1)
         self.assertEqual(sorted(server.load_pending(None)["chats"]), ["张三"])
+
+    def test_send_only_clears_messages_muse_has_seen(self):
+        self.pending()
+        add_notif(self.db, time.time(), title="张三", body="一")
+        self.pending()                                  # Muse 看到了「一」
+        add_notif(self.db, time.time(), title="张三", body="二")
+        self.jcall("GET", "/wechat/peek")               # peek 在后台收进了「二」，Muse 还没看到
+        _, body = self.jcall("POST", "/wechat/send", {"to": "张三", "text": "好的"})
+        self.assertEqual(body["acked"], 1)
+        self.assertEqual([m["text"] for m in server.load_pending(None)["chats"]["张三"]["messages"]], ["二"])
+
+    def test_ack_only_clears_messages_muse_has_seen(self):
+        self.pending()
+        add_notif(self.db, time.time(), title="张三", body="一")
+        self.pending()
+        add_notif(self.db, time.time(), title="张三", body="二")
+        self.jcall("GET", "/wechat/peek")
+        self.assertEqual(self.jcall("POST", "/wechat/ack", {"chat": "张三"})[1]["acked"], 1)
+        self.assertEqual([m["text"] for m in server.load_pending(None)["chats"]["张三"]["messages"]], ["二"])
+
+    def test_reused_rec_id_is_still_new(self):
+        self.pending()
+        add_notif(self.db, time.time(), title="张三", body="明天 2 点")
+        self.pending()
+        con = sqlite3.connect(self.db)
+        con.execute("DELETE FROM record WHERE rec_id = 1")   # 对方撤回：最新一条通知被删掉
+        con.commit()
+        con.close()
+        add_notif(self.db, time.time() + 1, title="张三", body="明天 3 点")   # 重发的这条拿到同一个 rec_id
+        self.assertEqual([m["text"] for m in self.pending()["pending"]["张三"]["messages"]], ["明天 2 点", "明天 3 点"])
 
     def test_unread_does_not_touch_peek_state(self):
         self.wx_out = json.dumps({"chats": []})
@@ -789,7 +809,7 @@ class MabTest(ServerCase):
         return path
 
     def test_peek(self):
-        server.save_peek("work", {"cursor": 0, "reminded": 0})
+        server.save_peek("work", {"seen": [], "reminded": 0})
         add_notif(self.db, time.time())
         r = self.mab("wechat-peek", "-a", "work")
         self.assertEqual(r.returncode, 0, r.stderr)
