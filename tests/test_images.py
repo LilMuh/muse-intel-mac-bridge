@@ -660,6 +660,14 @@ class MabTest(ServerCase):
             f.write(png())
         return path
 
+    def test_peek(self):
+        add_notif(self.db, time.time() + 1)
+        server.save_peek("work", {"since": time.time() - 10, "badge_base": 0, "reminded": 0})
+        r = self.mab("wechat-peek", "-a", "work")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        body = json.loads(r.stdout)
+        self.assertEqual((body["wake"], body["new"][0]["chat"]), (True, "张三"))
+
     def test_send_local_file_uploads_then_sends(self):
         r = self.mab("wechat-send", "文件传输助手", "--image", self.local_png())
         self.assertEqual(r.returncode, 0, r.stderr)
