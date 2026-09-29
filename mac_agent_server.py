@@ -108,7 +108,7 @@ pyautogui.FAILSAFE = True  # 把鼠标甩到屏幕左上角可紧急中断 agent
 pyautogui.PAUSE = 0.05
 
 lock = threading.Lock()
-peek_lock = threading.Lock()   # peek 不拿全局锁，只用它保护 peek 状态文件的「读→改→写」
+cache_lock = threading.Lock()   # peek 不拿全局锁；待处理缓存和 peek 状态的「读→改→写」都在这把锁里做
 state = {"img_w": None, "img_h": None}
 
 
@@ -307,9 +307,10 @@ def a_wechat_send(p):
     if code == 0 and not p.get("dry_run") and ids:
         # 消息已经发出去了：清缓存出错也不能报失败，否则 Muse 会重发
         try:
-            data = load_pending(p.get("account"))
-            n = clear_pending(data, to, max(ids))
-            save_pending(p.get("account"), data)
+            with cache_lock:
+                data = load_pending(p.get("account"))
+                n = clear_pending(data, to, max(ids))
+                save_pending(p.get("account"), data)
             result["acked"] = n
         except (OSError, ValueError) as e:
             result["ack_error"] = f"消息已发出，但待处理缓存没清掉：{e}"
@@ -369,38 +370,44 @@ def a_wechat_unread(p):
     args = ["--unread"] + (["--list-only"] if p.get("list_only") else [])
     if p.get("images"):
         prune_inbox(inbox_days())
-    started = time.time()   # 用开始时间：跑的过程中进来的通知下次还算新的
     # 要逐个点开聊天、点头像识别发送人，未读多时会很久
     code, out, err = run_wx(args, p.get("account"), env, timeout=1800)
     result = wx_json(code, out, err)
     log_recalls(p.get("account"), [(c.get("name", ""), c.get("messages", [])) for c in result.get("chats", [])])
-    data, new = load_pending(p.get("account")), set()
-    if result["ok"] and not p.get("list_only"):
-        new = add_pending(data, result.get("chats", []))
-        try:
-            save_pending(p.get("account"), data)
-        except OSError as e:
-            raise ValueError(f"待处理缓存写不进去（{e}），原始输出：{out}")
-        # 聊天太多被截断、或有聊天读失败：这些消息的通知和角标已经被这次吸收了，要靠 incomplete 再提醒
-        partial = any(c.get("error") for c in result.get("chats", [])) \
-            or any("只读了前" in n for n in result.get("notes", []))
-        mark_unread_done(p.get("account"), started, complete=not partial)
-    result["pending"] = pending_view(data, new)
+    with cache_lock:
+        data, new = load_pending(p.get("account")), set()
+        if result["ok"] and not p.get("list_only"):
+            new = add_pending(data, result.get("chats", []))
+            try:
+                save_pending(p.get("account"), data)
+            except OSError as e:
+                raise ValueError(f"待处理缓存写不进去（{e}），原始输出：{out}")
+        result["pending"] = pending_view(data, new)
     return result
 
 
 def a_wechat_pending(p):
-    view = pending_view(load_pending(p.get("account")))
-    return {"ok": True, "pending": view, "count": sum(len(c["messages"]) for c in view.values())}
+    """先把新通知收进待处理（不碰微信），再返回全部待处理；新收进来的标 new。"""
+    try:
+        got = ingest(p.get("account"))
+    except ValueError as e:   # 找不到这个账号的微信：照样返回现有待处理
+        got = {"new": set(), "notify_error": str(e)}
+    with cache_lock:
+        view = pending_view(load_pending(p.get("account")), got["new"])
+    result = {"ok": True, "pending": view, "count": sum(len(c["messages"]) for c in view.values())}
+    result.update({k: got[k] for k in ("note", "notify_error") if k in got})
+    return result
 
 
 def a_wechat_ack(p):
-    chat, data = text_arg(p, "chat"), load_pending(p.get("account"))
-    if chat not in data["chats"]:
-        raise ValueError(f"待处理里没有「{chat}」")
-    upto = p.get("upto_id")
-    n = clear_pending(data, chat, None if upto is None else int(upto))
-    save_pending(p.get("account"), data)
+    chat = text_arg(p, "chat")
+    with cache_lock:
+        data = load_pending(p.get("account"))
+        if chat not in data["chats"]:
+            raise ValueError(f"待处理里没有「{chat}」")
+        upto = p.get("upto_id")
+        n = clear_pending(data, chat, None if upto is None else int(upto))
+        save_pending(p.get("account"), data)
     return {"ok": True, "acked": n}
 
 
@@ -673,7 +680,8 @@ def add_pending(data, chats) -> set:
 
 def pending_view(data, new_ids=()) -> dict:
     """缓存里所有还没处理的消息，这次新进来的标 new。"""
-    return {name: {"group": c["group"], "messages": [dict(m, new=True) if m["id"] in new_ids else m for m in c["messages"]]}
+    return {name: dict({k: v for k, v in c.items() if k != "messages"},
+                       messages=[dict(m, new=True) if m["id"] in new_ids else m for m in c["messages"]])
             for name, c in data["chats"].items() if c["messages"]}
 
 
@@ -691,6 +699,29 @@ def clear_pending(data, chat, upto=None) -> int:
     return n
 
 
+def add_notices(data, notices) -> set:
+    """把通知收进待处理：按对方内部 ID 归到聊天，备注改名时整个聊天跟着改名；返回新消息 id。"""
+    now, new = time.strftime("%Y-%m-%dT%H:%M:%S"), set()
+    for n in notices:
+        name = n["chat"] or n["id"]
+        old = next((k for k, c in data["chats"].items() if n["id"] and k != name and c.get("chat_id") == n["id"]), None)
+        if old is not None and n["chat"]:
+            moved = data["chats"].pop(old)
+            moved.pop("name_unknown", None)
+            if name in data["chats"]:
+                moved["messages"] = sorted(moved["messages"] + data["chats"][name]["messages"], key=lambda m: m["id"])
+            data["chats"][name] = moved
+        entry = data["chats"].setdefault(name, {"group": False, "messages": []})
+        entry.update(group=n["id"].endswith("@chatroom"), chat_id=n["id"])
+        if not n["chat"]:
+            entry["name_unknown"] = True
+        item = dict(notice_message(n), id=data["next_id"], added=now)
+        data["next_id"] += 1
+        entry["messages"].append(item)
+        new.add(item["id"])
+    return new
+
+
 def peek_path(account) -> str:
     return os.path.join(PEEK_DIR, os.path.basename(pending_path(account)))
 
@@ -705,6 +736,35 @@ def load_peek(account) -> Optional[dict]:
 
 def save_peek(account, st):
     write_json(peek_path(account), st)
+
+
+def ingest(account) -> dict:
+    """把这个账号上次之后的新通知收进待处理，不碰微信；返回新消息 id，以及 note、notify_error。"""
+    bundle, out = wechat_bundle(account), {"new": set()}
+    with cache_lock:
+        st = load_peek(account) or {}
+        cursor = st.get("cursor")
+        try:
+            if cursor is not None:
+                got = read_notifications(bundle, cursor=cursor)
+                if cursor and got["lo"] is not None and got["lo"] > cursor:
+                    out["note"] = "通知太多，可能漏了一部分（每个微信只保留最近 100 条通知）"
+                cursor = got["last"] or cursor
+            elif "since" in st:   # 从旧版本升级：按时间补收一次，之后改用 cursor
+                got = read_notifications(bundle, since=st["since"])
+                cursor = max(got["hi"] or 0, got["last"] or 0)
+            else:                 # 第一次：历史通知不收
+                got = read_notifications(bundle)
+                cursor = got["hi"] or 0
+        except OSError as e:
+            out["notify_error"] = str(e)
+            return out
+        if got["items"]:
+            data = load_pending(account)
+            out["new"] = add_notices(data, got["items"])
+            save_pending(account, data)
+        save_peek(account, {"cursor": cursor, "reminded": st.get("reminded", 0)})
+    return out
 
 
 def stale_minutes() -> int:
@@ -729,7 +789,7 @@ def a_wechat_peek(account):
     bundle, now, minutes = wechat_bundle(account), time.time(), stale_minutes()
     badge = read_badge(bundle)
     result, reasons = {"ok": True, "new": [], "badge": badge}, []
-    with peek_lock:
+    with cache_lock:
         st = load_peek(account) or {"since": now, "badge_base": badge or 0, "reminded": 0}   # 第一次：历史不算新
         try:
             result["new"] = read_notifications(bundle, since=st["since"])["items"][-50:]
@@ -751,24 +811,6 @@ def a_wechat_peek(account):
     result.update(badge_base=st["badge_base"], pending=sum(len(c["messages"]) for c in data["chats"].values()),
                   incomplete=bool(st.get("incomplete")), reasons=reasons, wake=bool(reasons))
     return result
-
-
-def mark_unread_done(account, started, complete=True):
-    """unread 成功后更新 peek 状态：since 取开始时间、基线取当前角标、记下有没有读全；出错只记日志。"""
-    try:
-        badge = read_badge(wechat_bundle(account))
-    except Exception:
-        badge = None
-    try:
-        with peek_lock:
-            st = load_peek(account) or {"badge_base": 0, "reminded": 0}
-            st["since"] = started
-            st["incomplete"] = not complete
-            if badge is not None:
-                st["badge_base"] = badge
-            save_peek(account, st)
-    except Exception as e:
-        log.info("peek 状态没写进去：%s", e)
 
 
 def prune_inbox(days):

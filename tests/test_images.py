@@ -581,76 +581,12 @@ class PeekTest(ServerCase):
         self.assertEqual((body["wake"], body["reasons"], body["new"], body["badge"], body["badge_base"]),
                          (False, [], [], 3, 3))
 
-    def test_new_until_unread_succeeds(self):
-        self.state()
-        add_notif(self.db, time.time() - 50, title="张三", body="在吗", chatname="wxid_zs")
-        body = self.peek()
-        self.assertEqual(body["reasons"], ["new"])
-        self.assertEqual([(n["chat"], n["id"], n["preview"]) for n in body["new"]], [("张三", "wxid_zs", "在吗")])
-        self.assertTrue(self.peek()["wake"])          # 没跑 unread 之前一直唤醒
-        self.wx_code = 6
-        self.unread()
-        self.assertTrue(self.peek()["wake"])          # unread 失败不算
-        self.wx_code = 0
-        self.unread(list_only=True)
-        self.assertTrue(self.peek()["wake"])          # list_only 不算
-        self.unread()
-        self.assertFalse(self.peek()["wake"])
-
-    def test_notification_during_unread_still_new(self):
-        self.state()
-        def slow_run_wx(args, account=None, env=None, timeout=300):
-            add_notif(self.db, time.time())           # unread 跑的过程中进来的
-            return 0, json.dumps({"chats": []}), ""
-        server.run_wx = slow_run_wx
-        self.jcall("POST", "/wechat/unread", {})
-        self.assertEqual(self.peek()["reasons"], ["new"])
-
-    def test_unread_ok_even_if_peek_state_fails(self):
-        def broken(account, st):
-            raise OSError("磁盘满了")
-        self.addCleanup(setattr, server, "save_peek", server.save_peek)
-        server.save_peek = broken
-        status, body = self.unread()
-        self.assertEqual((status, body["ok"]), (200, True))
-
     def test_unread_ok_even_if_bundle_lookup_crashes(self):
         def broken(account):
             raise RuntimeError("Info.plist 坏了")
         server.wechat_bundle = broken
         status, body = self.unread()
         self.assertEqual((status, body["ok"]), (200, True))
-
-    def test_partial_unread_rewakes_later(self):
-        for chats in ({"chats": [{"name": "张三", "error": "点开的不是张三"}]},
-                      {"chats": [], "notes": ["未读聊天有 25 个，只读了前 20 个"]}):
-            self.state()
-            self.wx_out = json.dumps(chats)
-            self.jcall("POST", "/wechat/unread", {})
-            body = self.peek()
-            self.assertEqual((body["reasons"], body["incomplete"]), (["incomplete"], True))
-            self.assertFalse(self.peek()["wake"])      # 同一个间隔里不重复提醒
-            st = server.load_peek(None)
-            st["reminded"] -= 31 * 60
-            server.save_peek(None, st)
-            self.assertEqual(self.peek()["reasons"], ["incomplete"])
-            self.unread()                              # 下一次读全了就不再提醒
-            st = server.load_peek(None)
-            st["reminded"] -= 31 * 60
-            server.save_peek(None, st)
-            self.assertEqual((self.peek()["wake"], self.peek()["incomplete"]), (False, False))
-
-    def test_badge_against_base(self):
-        self.badge = 3
-        self.peek()                                    # 基线 3
-        self.badge = 1
-        self.assertEqual((self.peek()["wake"], self.peek()["badge_base"]), (False, 1))   # 手机上读掉了：基线跟着降
-        self.badge = 2
-        body = self.peek()
-        self.assertEqual((body["reasons"], body["badge_base"]), (["badge"], 1))
-        self.badge = 5
-        self.unread()                                  # unread 后基线取当时的角标
-        self.assertEqual((self.peek()["wake"], self.peek()["badge_base"]), (False, 5))
 
     def test_badge_none_when_not_running(self):
         self.badge = None
@@ -718,6 +654,129 @@ class PeekTest(ServerCase):
             self.peek()
             time.sleep(0.2)
         self.assertIn("/wechat/peek", cm.records[0].getMessage())
+
+
+class IngestTest(ServerCase):
+    def pending(self):
+        status, body = self.jcall("POST", "/wechat/pending", {})
+        self.assertEqual(status, 200, body)
+        return body
+
+    def test_first_call_skips_history(self):
+        add_notif(self.db, time.time() - 60)
+        body = self.pending()
+        self.assertEqual(body["count"], 0)
+        self.assertEqual(server.load_peek(None), {"cursor": 1, "reminded": 0})
+
+    def test_new_private_message(self):
+        self.pending()
+        add_notif(self.db, time.time(), title="张三", body="在吗", chatname="wxid_zs")
+        add_notif(self.db, time.time(), title="别的 App", app_id=2)
+        chat = self.pending()["pending"]["张三"]
+        self.assertEqual((chat["group"], chat["chat_id"]), (False, "wxid_zs"))
+        m = chat["messages"][0]
+        self.assertEqual((m["id"], m["text"], m["rec"], m["new"]), (1, "在吗", 1, True))
+        self.assertNotIn("new", self.pending()["pending"]["张三"]["messages"][0])   # 同一条只收一次
+
+    def test_group_and_needs_read(self):
+        self.pending()
+        add_notif(self.db, time.time(), title="项目群", body="李四: [图片] ", chatname="123@chatroom")
+        chat = self.pending()["pending"]["项目群"]
+        self.assertEqual((chat["group"], chat["messages"][0]["sender"], chat["messages"][0]["needs_read"]),
+                         (True, "李四", ["image"]))
+
+    def test_rename_moves_chat_and_merges(self):
+        self.pending()
+        add_notif(self.db, time.time(), title="小明", body="一", chatname="wxid_xm")
+        add_notif(self.db, time.time(), title="备注 小明", body="占位", chatname="wxid_other")
+        self.pending()   # 「备注 小明」这个名字已经被另一个聊天占着：合并时两边的消息都不能丢
+        add_notif(self.db, time.time(), title="备注 小明", body="二", chatname="wxid_xm")
+        pending = self.pending()["pending"]
+        self.assertNotIn("小明", pending)
+        self.assertEqual([m["text"] for m in pending["备注 小明"]["messages"]], ["一", "占位", "二"])
+        self.assertEqual(pending["备注 小明"]["chat_id"], "wxid_xm")
+
+    def test_no_title_uses_chat_id(self):
+        self.pending()
+        add_notif(self.db, time.time(), title=None, body="你收到了一条消息", chatname="wxid_zs")
+        chat = self.pending()["pending"]["wxid_zs"]
+        self.assertTrue(chat["name_unknown"])
+        add_notif(self.db, time.time(), title="张三", body="在吗", chatname="wxid_zs")   # 后来开了消息详情
+        pending = self.pending()["pending"]
+        self.assertNotIn("wxid_zs", pending)
+        self.assertNotIn("name_unknown", pending["张三"])
+        self.assertEqual(len(pending["张三"]["messages"]), 2)
+
+    def test_upgrade_from_since(self):
+        server.save_peek(None, {"since": time.time() - 100, "badge_base": 2, "reminded": 5, "incomplete": True})
+        add_notif(self.db, time.time() - 200, body="升级前的")
+        add_notif(self.db, time.time() - 50, body="升级后的")
+        self.assertEqual([m["text"] for m in self.pending()["pending"]["张三"]["messages"]], ["升级后的"])
+        self.assertEqual(server.load_peek(None), {"cursor": 2, "reminded": 5})
+
+    def test_cursor_follows_rows_not_stats(self):
+        server.save_peek(None, {"cursor": 0, "reminded": 0})
+        item = {"rec": 5, "chat": "张三", "id": "wxid_zs", "preview": "在吗", "time": "2026-09-29T14:25:30"}
+        orig = server.read_notifications
+        server.read_notifications = lambda bundle, cursor=None, since=None: {"items": [item], "last": 5, "lo": 1, "hi": 9}
+        self.addCleanup(setattr, server, "read_notifications", orig)
+        self.pending()
+        self.assertEqual(server.load_peek(None)["cursor"], 5)
+
+    def test_gap_note(self):
+        for _ in range(10):
+            add_notif(self.db, time.time())
+        con = sqlite3.connect(self.db)
+        con.execute("DELETE FROM record WHERE rec_id <= 8")   # 100 条上限把没读到的挤掉了
+        con.commit()
+        con.close()
+        server.save_peek(None, {"cursor": 5, "reminded": 0})
+        self.assertIn("可能漏了", self.pending()["note"])
+
+    def test_notify_error_keeps_cache_and_cursor(self):
+        server.save_peek(None, {"cursor": 3, "reminded": 0})
+        server.NOTIFY_DBS = [os.path.join(self.tmp, "nope")]
+        body = self.pending()
+        self.assertIn("打不开通知数据库", body["notify_error"])
+        self.assertEqual(server.load_peek(None)["cursor"], 3)
+
+    def test_save_failure_keeps_cursor(self):
+        self.pending()
+        add_notif(self.db, time.time())
+        def broken(account, data):
+            raise OSError("磁盘满了")
+        self.addCleanup(setattr, server, "save_pending", server.save_pending)
+        server.save_pending = broken
+        self.assertEqual(self.jcall("POST", "/wechat/pending", {})[0], 400)
+        self.assertEqual(server.load_peek(None)["cursor"], 0)   # 下次还会重收这一条
+
+    def test_ingest_and_ack_do_not_overwrite_each_other(self):
+        self.pending()
+        server.save_pending(None, {"next_id": 2, "chats": {"李四": {"group": False, "messages": [
+            {"id": 1, "text": "x", "added": "2026-09-29T00:00:00"}]}}})
+        add_notif(self.db, time.time(), title="张三", body="在吗")
+        acked = []
+        orig = server.add_notices
+
+        def slow(data, notices):
+            t = threading.Thread(target=lambda: acked.append(self.jcall("POST", "/wechat/ack", {"chat": "李四"})))
+            t.start()
+            t.join(0.5)   # 有 cache_lock 时 ack 要等收消息写完；没有锁的话 ack 会先写，再被收消息覆盖
+            self.addCleanup(t.join)
+            return orig(data, notices)
+        server.add_notices = slow
+        self.addCleanup(setattr, server, "add_notices", orig)
+        server.ingest(None)   # 直接调用，不拿全局锁：ack（POST）只会被 cache_lock 挡住
+        for _ in range(50):
+            if acked:
+                break
+            time.sleep(0.1)
+        self.assertEqual(sorted(server.load_pending(None)["chats"]), ["张三"])
+
+    def test_unread_does_not_touch_peek_state(self):
+        self.wx_out = json.dumps({"chats": []})
+        self.jcall("POST", "/wechat/unread", {})
+        self.assertIsNone(server.load_peek(None))
 
 
 class MabTest(ServerCase):
