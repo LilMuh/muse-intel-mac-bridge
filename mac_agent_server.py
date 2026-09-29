@@ -44,11 +44,14 @@ Retina 缩放与截图缩放比例 agent 都无需关心。
   WX_ACCOUNTS   微信账号：别名=App 路径，多个用逗号分隔（只开一个微信可不填）
   WX_FRIEND_GREETING  通过好友申请后自动发的第一句话（不填就不发）
   WX_IMAGE_MAX_MB  单张图片上限，默认 50（只在请求阶段按请求大小检查）
+  BRIDGE_LOG    请求日志，默认 ~/Library/Logs/mab-bridge.log（满 5 MB 轮换，留 3 份）
   WX_MAX_IMAGES / WX_IMAGE_WAIT / WX_INBOX_DAYS  读图：每次最多几张（10）、复制后等几秒（3）、inbox 保留几天（3）
 """
 import base64
 import hmac
 import json
+import logging
+import logging.handlers
 import os
 import re
 import subprocess
@@ -77,6 +80,7 @@ WX_SEND = os.path.expanduser(os.environ.get(
 OUTBOX = os.path.join(os.path.dirname(os.path.abspath(__file__)), "outbox")
 INBOX = os.path.join(os.path.dirname(os.path.abspath(__file__)), "inbox")
 PENDING_DIR = os.path.expanduser("~/.cache/wx-send/pending")   # 待处理消息缓存：unread 读到的，回复或 ack 后才清
+LOG_FILE = os.path.expanduser(os.environ.get("BRIDGE_LOG", "~/Library/Logs/mab-bridge.log"))
 IMAGE_MAX = int(float(os.environ.get("WX_IMAGE_MAX_MB", "50")) * 1024 * 1024)   # 防止请求过大撑爆内存，不是微信的限制
 IMAGE_EXTS = ("jpg", "jpeg", "png", "gif", "heic")
 IMAGE_NAME = re.compile(r"^[A-Za-z0-9_\u4e00-\u9fff-][A-Za-z0-9._ \u4e00-\u9fff-]*$")   # 允许空格：Mac 截图的文件名带空格
@@ -563,26 +567,48 @@ ACTIONS = {
 }
 
 
+log = logging.getLogger("bridge")
+
+
+def setup_log():
+    os.makedirs(os.path.dirname(LOG_FILE), exist_ok=True)
+    h = logging.handlers.RotatingFileHandler(LOG_FILE, maxBytes=5 * 1048576, backupCount=3, encoding="utf-8")
+    h.setFormatter(logging.Formatter("%(asctime)s\t%(message)s", "%Y-%m-%d %H:%M:%S"))
+    log.addHandler(h)
+    log.setLevel(logging.INFO)
+
+
 class Handler(BaseHTTPRequestHandler):
     server_version = f"muse-intel-mac-bridge/{__version__}"
+    started, what = 0.0, ""   # 请求开始时间、日志里记的参数（不含消息内容和图片）
 
     def _authed(self):
         got = self.headers.get("Authorization", "")
         return hmac.compare_digest(got.encode(), f"Bearer {TOKEN}".encode())
 
     def _send(self, code, body, ctype="application/json; charset=utf-8", extra=None):
+        note = ""
+        if isinstance(body, dict) and (body.get("error") or body.get("ok") is False):
+            note = str(body.get("error") or f'{body.get("status")}: {body.get("output", "")}')[:500]
         if isinstance(body, (dict, list)):
             body = json.dumps(body, ensure_ascii=False).encode()
-        self.send_response(code)
-        self.send_header("Content-Type", ctype)
-        self.send_header("Content-Length", str(len(body)))
-        self.send_header("Cache-Control", "no-store")
-        for k, v in (extra or {}).items():
-            self.send_header(k, str(v))
-        self.end_headers()
-        self.wfile.write(body)
+        try:
+            self.send_response(code)
+            self.send_header("Content-Type", ctype)
+            self.send_header("Content-Length", str(len(body)))
+            self.send_header("Cache-Control", "no-store")
+            for k, v in (extra or {}).items():
+                self.send_header(k, str(v))
+            self.end_headers()
+            self.wfile.write(body)
+        except OSError as e:   # 客户端（或隧道）在我们回复前已经断开，连接已经没用了
+            note = f"回复时连接已断开：{e!r}；{note}"
+            self.close_connection = True
+        log.info("%s\t%s\t%s\t%.1fs\t%d 字节\t%s\t%s", self.command, urlparse(self.path).path, code,
+                 time.time() - self.started, len(body), self.what, note.replace("\n", " ⏎ "))
 
     def do_GET(self):
+        self.started = time.time()
         if not self._authed():
             return self._send(401, {"error": "unauthorized"})
         path = urlparse(self.path).path
@@ -615,6 +641,7 @@ class Handler(BaseHTTPRequestHandler):
             return self._send(500, {"error": str(e)})
 
     def do_POST(self):
+        self.started = time.time()
         if not self._authed():
             return self._send(401, {"error": "unauthorized"})
         action = ACTIONS.get(urlparse(self.path).path.strip("/"))
@@ -631,6 +658,8 @@ class Handler(BaseHTTPRequestHandler):
                     length -= len(chunk)
                 return self._send(413, {"error": f"请求太大，图片最大 {IMAGE_MAX // 1048576} MB（WX_IMAGE_MAX_MB）"})
             payload = json.loads(self.rfile.read(length) or b"{}")
+            self.what = json.dumps({k: payload[k] for k in ("account", "chat", "to", "limit", "images", "list_only", "image")
+                                    if k in payload}, ensure_ascii=False)
             with lock:
                 result = action(payload)
             return self._send(200, result or {"ok": True})
@@ -650,6 +679,7 @@ def main():
           f"(screenshot width {TARGET_W})", flush=True)
     os.makedirs(OUTBOX, exist_ok=True)
     os.makedirs(INBOX, exist_ok=True)
+    setup_log()
     ThreadingHTTPServer((HOST, PORT), Handler).serve_forever()
 
 

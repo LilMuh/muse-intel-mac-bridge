@@ -3,11 +3,13 @@ import http.client
 import json
 import os
 import shutil
+import socket
 import struct
 import subprocess
 import sys
 import tempfile
 import threading
+import time
 import types
 import unittest
 import zlib
@@ -522,6 +524,43 @@ class MabTest(ServerCase):
         m = json.loads(r.stdout)["pending"]["张三"]["messages"][0]
         self.assertTrue(os.path.isfile(m["local_path"]))
         self.assertEqual(os.listdir(os.path.join(self.tmp, "got")), ["in-1.png"])
+
+
+class LogTest(ServerCase):
+    def test_logs_failure_reason(self):
+        self.wx_code, self.wx_out = 2, "搜不到"
+        with self.assertLogs("bridge") as cm:
+            self.jcall("POST", "/wechat/read", {"chat": "张三", "account": "work"})
+            self.jcall("POST", "/wechat/read", {"chat": "张三", "limit": 0})
+        ok, bad = cm.records[0].getMessage(), cm.records[1].getMessage()
+        self.assertIn("/wechat/read\t200", ok)
+        self.assertIn('"chat": "张三"', ok)
+        self.assertIn("not_found: 搜不到", ok)
+        self.assertIn("\t400\t", bad)
+        self.assertIn("limit 至少是 1", bad)
+
+    def test_logs_client_gone(self):
+        closed = threading.Event()
+
+        def slow_run_wx(args, account=None, env=None, timeout=300):
+            closed.wait(10)
+            time.sleep(0.3)
+            return 0, '{"chat":"张三","items":[]}', ""
+        server.run_wx = slow_run_wx
+        s = socket.create_connection(("127.0.0.1", self.httpd.server_port))
+        body = json.dumps({"chat": "张三"}).encode()
+        s.sendall(b"POST /wechat/read HTTP/1.1\r\nHost: x\r\nAuthorization: Bearer " + TOKEN.encode()
+                  + b"\r\nContent-Length: " + str(len(body)).encode() + b"\r\n\r\n" + body)
+        s.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER, struct.pack("ii", 1, 0))   # 关闭时直接发 RST
+        with self.assertLogs("bridge") as cm:
+            time.sleep(0.2)
+            s.close()
+            closed.set()
+            for _ in range(50):
+                if cm.records:
+                    break
+                time.sleep(0.1)
+        self.assertIn("回复时连接已断开", cm.records[0].getMessage())
 
 
 if __name__ == "__main__":
