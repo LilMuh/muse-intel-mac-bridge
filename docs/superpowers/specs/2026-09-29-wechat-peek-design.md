@@ -70,12 +70,14 @@ peek 查出本账号 `delivered_date > since` 的所有记录，作为 `new` 返
 
 30 分钟可以用 `WX_PEEK_STALE_MIN` 改。
 
+**没读全**：`unread` 返回成功，但有聊天读失败（带 `error`）或未读聊天太多被截断（note「只读了前 N 个」）时，这些消息的通知和角标已经被这次 `unread` 吸收，也不在待处理缓存里。这时 peek 状态记 `incomplete`，peek 按超时提醒的节奏（共用 `reminded`）返回原因 `incomplete`，直到下一次 `unread` 读全。（整体审查时补上）
+
 ## 接口
 
 `GET /wechat/peek?account=work`（`account` 可省，规则同下）
 
 ```json
-{"ok": true, "wake": true, "reasons": ["new", "badge", "stale"],
+{"ok": true, "wake": true, "reasons": ["new", "badge", "stale", "incomplete"], "incomplete": false,
  "new": [{"chat": "张三", "id": "wxid_abc123", "preview": "在吗", "time": "2026-09-29T14:53:39"}],
  "badge": 3, "badge_base": 1,
  "pending": 4,

@@ -378,7 +378,10 @@ def a_wechat_unread(p):
             save_pending(p.get("account"), data)
         except OSError as e:
             raise ValueError(f"待处理缓存写不进去（{e}），原始输出：{out}")
-        mark_unread_done(p.get("account"), started)
+        # 聊天太多被截断、或有聊天读失败：这些消息的通知和角标已经被这次吸收了，要靠 incomplete 再提醒
+        partial = any(c.get("error") for c in result.get("chats", [])) \
+            or any("只读了前" in n for n in result.get("notes", []))
+        mark_unread_done(p.get("account"), started, complete=not partial)
     result["pending"] = pending_view(data, new)
     return result
 
@@ -530,7 +533,13 @@ def read_notifications(bundle, since) -> list:
         except sqlite3.Error as e:
             errors.append(f"{path}：{e}")
             continue
-        return [parse_notification(data, t + CD_EPOCH) for data, t in rows]
+        out = []
+        for data, t in rows:
+            try:
+                out.append(parse_notification(data, t + CD_EPOCH))
+            except Exception:   # 一条坏记录不能拖垮整个 peek
+                continue
+        return out
     raise OSError("打不开通知数据库：" + ("；".join(errors) or "没找到"))
 
 
@@ -703,29 +712,31 @@ def a_wechat_peek(account):
             reasons.append("badge")
         data = load_pending(account)
         result["stale"] = stale_chats(data, time.strftime("%Y-%m-%dT%H:%M:%S", time.localtime(now - minutes * 60)))
-        if result["stale"] and now - st["reminded"] >= minutes * 60:
-            reasons.append("stale")
+        late = [r for r, on in (("stale", result["stale"]), ("incomplete", st.get("incomplete"))) if on]
+        if late and now - st["reminded"] >= minutes * 60:
+            reasons += late
             st["reminded"] = now
         save_peek(account, st)
     result.update(badge_base=st["badge_base"], pending=sum(len(c["messages"]) for c in data["chats"].values()),
-                  reasons=reasons, wake=bool(reasons))
+                  incomplete=bool(st.get("incomplete")), reasons=reasons, wake=bool(reasons))
     return result
 
 
-def mark_unread_done(account, started):
-    """unread 成功后：新通知从这次开始的时间算起，角标基线取现在的值；出错只记日志，不影响 unread 的结果。"""
+def mark_unread_done(account, started, complete=True):
+    """unread 成功后更新 peek 状态：since 取开始时间、基线取当前角标、记下有没有读全；出错只记日志。"""
     try:
         badge = read_badge(wechat_bundle(account))
-    except ValueError:
+    except Exception:
         badge = None
     try:
         with peek_lock:
             st = load_peek(account) or {"badge_base": 0, "reminded": 0}
             st["since"] = started
+            st["incomplete"] = not complete
             if badge is not None:
                 st["badge_base"] = badge
             save_peek(account, st)
-    except (OSError, ValueError) as e:
+    except Exception as e:
         log.info("peek 状态没写进去：%s", e)
 
 

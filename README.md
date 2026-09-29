@@ -264,6 +264,7 @@ python3 mab.py wechat-peek -a work
 - **新通知**（`new`）：读 macOS 的通知记录，列出上次 `wechat-unread` 之后送达的微信通知。`wechat-unread` 成功之前会一直唤醒。
 - **Dock 角标**（`badge`）：角标比上次 `wechat-unread` 之后的值高就唤醒（在手机上读掉了几条，基线会跟着降）。
 - **超时没处理**（`stale`）：待处理消息超过 30 分钟（`WX_PEEK_STALE_MIN`）还没回复或 `ack`，每 30 分钟提醒一次。
+- **没读全**（`incomplete`）：上次 `wechat-unread` 有聊天读失败，或未读聊天太多只读了一部分，同样每 30 分钟提醒一次，直到读全。
 
 注意：
 - 要在微信设置里打开「通知显示消息详情」，否则 `new` 里只有 `id`，没有聊天名和预览。

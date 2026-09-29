@@ -193,6 +193,15 @@ class NotifyTest(unittest.TestCase):
         with self.assertRaises(OSError):
             server.read_notifications("com.test.wechat", 0)
 
+    def test_bad_record_is_skipped(self):
+        add_notif(self.db, 2000, body="好的")
+        con = sqlite3.connect(self.db)
+        con.execute("INSERT INTO record (app_id, data, delivered_date) VALUES (1, ?, ?)", (b"garbage", 2001 - 978307200))
+        con.execute("INSERT INTO record (app_id, data, delivered_date) VALUES (1, NULL, ?)", (2002 - 978307200,))
+        con.commit()
+        con.close()
+        self.assertEqual([n["preview"] for n in server.read_notifications("com.test.wechat", 0)], ["好的"])
+
     def test_parse_badge(self):
         self.assertIsNone(server.parse_badge(""))                                   # 没在运行
         self.assertEqual(server.parse_badge('"StatusLabel"=[ NULL ] \n'), 0)       # 在运行，从没设过角标
@@ -567,6 +576,32 @@ class PeekTest(ServerCase):
         server.save_peek = broken
         status, body = self.unread()
         self.assertEqual((status, body["ok"]), (200, True))
+
+    def test_unread_ok_even_if_bundle_lookup_crashes(self):
+        def broken(account):
+            raise RuntimeError("Info.plist 坏了")
+        server.wechat_bundle = broken
+        status, body = self.unread()
+        self.assertEqual((status, body["ok"]), (200, True))
+
+    def test_partial_unread_rewakes_later(self):
+        for chats in ({"chats": [{"name": "张三", "error": "点开的不是张三"}]},
+                      {"chats": [], "notes": ["未读聊天有 25 个，只读了前 20 个"]}):
+            self.state()
+            self.wx_out = json.dumps(chats)
+            self.jcall("POST", "/wechat/unread", {})
+            body = self.peek()
+            self.assertEqual((body["reasons"], body["incomplete"]), (["incomplete"], True))
+            self.assertFalse(self.peek()["wake"])      # 同一个间隔里不重复提醒
+            st = server.load_peek(None)
+            st["reminded"] -= 31 * 60
+            server.save_peek(None, st)
+            self.assertEqual(self.peek()["reasons"], ["incomplete"])
+            self.unread()                              # 下一次读全了就不再提醒
+            st = server.load_peek(None)
+            st["reminded"] -= 31 * 60
+            server.save_peek(None, st)
+            self.assertEqual((self.peek()["wake"], self.peek()["incomplete"]), (False, False))
 
     def test_badge_against_base(self):
         self.badge = 3
