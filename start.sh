@@ -35,7 +35,7 @@ if [[ "${1:-}" == "--funnel" ]]; then
   if [[ -z "$TS" ]]; then
     echo "未找到 tailscale，请先安装：brew install --cask tailscale"; exit 1
   fi
-  echo "==> 开启 Tailscale Funnel（端口 $PORT）"
+  echo "==> 开启 Tailscale Funnel（端口 ${PORT}）"
   "$TS" funnel --bg "$PORT"
   "$TS" funnel status || true
 fi

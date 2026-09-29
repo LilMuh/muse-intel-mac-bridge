@@ -4,8 +4,10 @@
 # 用法：
 #   ./wx-send.sh -a work "联系人或群名" "消息内容"     发送
 #   ./wx-send.sh -a work --batch 名单.tsv            批量发送（每行：联系人<Tab>消息，消息里的 \n 表示换行）
-#   ./wx-send.sh -a work --read "联系人" [条数]         读取聊天记录（JSON，默认最近 20 条，只含当前加载出来的）
+#   ./wx-send.sh -a work --image "联系人" 图片路径      发一张图片（粘贴后核对，再发送）
+#   ./wx-send.sh -a work --read "联系人" [条数]         读取聊天记录（JSON，默认最近 20 条，不够时往上翻着读）
 #   ./wx-send.sh -a work --unread [--list-only]          读所有未读聊天的新消息（JSON；免打扰的只读 WX_MUTED_ALLOW 里的群）
+#   ./wx-send.sh -a work --whois "联系人"               查私聊联系人的昵称和微信号（点对方头像读资料卡）
 #   ./wx-send.sh -a work --friends [--accept]            列出（加 --accept 则通过）等待验证的好友申请；通过后发 WX_FRIEND_GREETING
 #   ./wx-send.sh -a work --forget "联系人"               删掉某个聊天的读取进度（下次按「N条未读」重新读）
 #   ./wx-send.sh -a work --prune [天数]                  删掉 N 天（默认 3 天）没更新过的读取进度；--unread 每天会自动清一次
@@ -36,6 +38,8 @@
 #   WX_INPUT_H=118      输入框文字区高度（不含上方工具栏）
 #   WX_TOOLBAR_H=40     输入框上方工具栏高度
 #   WX_LOG=路径          日志位置，默认 ~/Library/Logs/wx-send.log
+#   WX_IMAGES=1         --read / --unread 时顺便取图片（右键「复制」），存到仓库的 inbox/
+#   WX_MAX_IMAGES=10    每次最多取几张
 #
 # 退出码：0 成功 · 2 没搜到 · 3 同名 · 4 标题/输入校验失败 · 5 环境或窗口问题
 #        6 焦点被切走 · 7 输入框有草稿 · 8 发送失败 · 9 超出每日上限 · 10 无法确认是否发出（不要直接重试）
@@ -88,18 +92,19 @@ aliases() {
   echo "${out:-无}"
 }
 
-usage() { sed -n '2,21p' "$0" | sed 's/^# \{0,1\}//' >&2; exit 64; }
+usage() { sed -n '2,22p' "$0" | sed 's/^# \{0,1\}//' >&2; exit 64; }
 
 build() {
   mkdir -p "$CACHE"
-  local src="$CACHE/wxsend.swift" new="$CACHE/wxsend.new.swift"
+  # 临时文件带进程号：同时有两个调用在编译时互不覆盖；最后的 mv 是原子改名，谁后完成谁生效（内容一样）
+  local src="$CACHE/wxsend.swift" new="$CACHE/wxsend.new.$$.swift" out="$BIN.$$.tmp"
   swift_source > "$new"
   if cmp -s "$new" "$src" && [[ -x "$BIN" ]]; then rm -f "$new"; return; fi
-  command -v swiftc >/dev/null || { echo "缺少 swiftc，请先运行：xcode-select --install" >&2; exit 1; }
+  command -v swiftc >/dev/null || { rm -f "$new"; echo "缺少 swiftc，请先运行：xcode-select --install" >&2; exit 1; }
   echo "正在编译（只在首次或脚本更新后进行，约 20–60 秒）…" >&2
   # 编译成功才更新缓存的源码，否则下次会以为没变而运行旧程序
-  if swiftc -O -target "$(uname -m)-apple-macos13.0" "$new" -o "$BIN.tmp" >&2; then mv "$BIN.tmp" "$BIN"; mv "$new" "$src"
-  else rm -f "$new"; echo "编译失败，请把上面的报错发给我" >&2; exit 1; fi
+  if swiftc -O -target "$(uname -m)-apple-macos13.0" "$new" -o "$out" >&2; then mv "$out" "$BIN"; mv "$new" "$src"
+  else rm -f "$new" "$out"; echo "编译失败，请把上面的报错发给我" >&2; exit 1; fi
 }
 
 # ---------- 参数 ----------
@@ -166,6 +171,13 @@ let DAILY_MAX = Int(envD("WX_DAILY_MAX", 500))
 let CONFIRM = env["WX_NO_CONFIRM"] != "1"
 let SENDERS = env["WX_UNREAD_SENDERS"] != "0"   // 读未读时点头像识别发送人
 let REMARK = env["WX_UNREAD_REMARK"] != "0"     // 读完把点开过的聊天标回未读
+let HOME_CHAT = "文件传输助手"                    // 读完未读后停在这个聊天
+let IMAGES = env["WX_IMAGES"] == "1"               // 读消息时顺便取图
+let MAX_IMAGES = Int(envD("WX_MAX_IMAGES", 10))
+let IMAGE_WAIT = envD("WX_IMAGE_WAIT", 3)          // 点「复制」后等剪贴板出现图片的秒数
+let INBOX = env["WX_INBOX"] ?? ""
+let COPY_TITLE = "复制"                             // 图片右键菜单里的「复制」（实测）
+let IMG_DX = CGFloat(envD("WX_IMG_DX", 110))       // 图片气泡中心离这一行左右边缘的距离（实测：这一行是整宽的 AXStaticText，没有子元素）
 let TITLE_MINX = CGFloat(envD("WX_TITLE_MINX", 270))
 let TITLE_H = CGFloat(envD("WX_TITLE_H", 80))
 let LIST_W = CGFloat(envD("WX_LIST_W", 420))
@@ -339,6 +351,56 @@ func pasteText(_ s: String) {
     key(K_V, cmd: true)
 }
 
+/// 把图片以 NSImage 放进剪贴板并粘贴（实测和截图复制一样，微信当图片处理，不弹确认框）
+func pasteImage(_ path: String) {
+    let pb = NSPasteboard.general
+    pb.clearContents()
+    if let img = NSImage(contentsOf: URL(fileURLWithPath: path)) { pb.writeObjects([img]) }
+    usleep(50_000)
+    key(K_V, cmd: true)
+}
+
+/// 图片消息在聊天记录里的 AX 标题（实测）
+let IMAGE_ROW_TITLES: Set<String> = ["图片"]
+
+/// 要发的内容：一段文字，或一张图片（文件绝对路径）
+enum Outgoing {
+    case text(String)
+    case image(String)
+
+    var isImage: Bool { if case .image = self { return true }; return false }
+
+    var logText: String {
+        switch self {
+        case .text(let s): return s
+        case .image(let p): return "[图片] " + (p as NSString).lastPathComponent
+        }
+    }
+
+    func paste() {
+        switch self {
+        case .text(let s): pasteText(s)
+        case .image(let p): pasteImage(p)
+        }
+    }
+
+    /// 粘贴后输入框里的内容是不是这条
+    func inBox(_ seen: String) -> Bool {
+        switch self {
+        case .text(let s): return sameInput(seen, s)
+        case .image: return seen.trimmingCharacters(in: .whitespacesAndNewlines) == "\u{FFFC}"
+        }
+    }
+
+    /// 聊天记录的最后一行是不是这条（行尾空格已去掉）
+    func isSentRow(_ title: String) -> Bool {
+        switch self {
+        case .text(let s): return sameInput(title, s)
+        case .image: return IMAGE_ROW_TITLES.contains(title.trimmingCharacters(in: .whitespaces))
+        }
+    }
+}
+
 // MARK: - 截图 + 文字识别
 
 struct Line { var raw: String; var text: String; var x0: CGFloat; var x1: CGFloat; var cy: CGFloat; var h: CGFloat }
@@ -495,6 +557,33 @@ func axFind(_ e: AXUIElement, _ depth: Int = 0, _ match: (AXUIElement) -> Bool) 
     for c in axChildren(e) { if let f = axFind(c, depth + 1, match) { return f } }
     return nil
 }
+/// e 是不是 ancestor 本身或它的后代（往上找 6 层）
+func isInside(_ e: AXUIElement, _ ancestor: AXUIElement) -> Bool {
+    var cur: AXUIElement? = e
+    for _ in 0..<6 {
+        guard let c = cur else { return false }
+        if CFEqual(c, ancestor) { return true }
+        cur = axParent(c)
+    }
+    return false
+}
+
+/// 剪贴板里的图片：优先原文件（文件 URL），其次 PNG / JPEG / GIF，最后 TIFF 转 PNG；返回 (数据, 扩展名)
+func imageFromPasteboard(_ pb: NSPasteboard) -> (Data, String)? {
+    if let url = (pb.readObjects(forClasses: [NSURL.self], options: [.urlReadingFileURLsOnly: true]) as? [URL])?.first,
+       let ext = ["png", "jpg", "jpeg", "gif"].first(where: { $0 == url.pathExtension.lowercased() }),
+       let d = try? Data(contentsOf: url) {
+        return (d, ext == "jpeg" ? "jpg" : ext)
+    }
+    let types: [(NSPasteboard.PasteboardType, String)] = [
+        (.png, "png"), (NSPasteboard.PasteboardType("public.jpeg"), "jpg"), (NSPasteboard.PasteboardType("com.compuserve.gif"), "gif")]
+    for (t, ext) in types { if let d = pb.data(forType: t) { return (d, ext) } }
+    if let d = pb.data(forType: .tiff), let rep = NSBitmapImageRep(data: d),
+       let png = rep.representation(using: .png, properties: [:]) {
+        return (png, "png")
+    }
+    return nil
+}
 /// 两个名字是否完全一样（只忽略首尾空格和群名后的人数）
 func sameName(_ a: String, _ b: String) -> Bool {
     let x = stripCount(a.trimmingCharacters(in: .whitespaces)), y = stripCount(b.trimmingCharacters(in: .whitespaces))
@@ -553,20 +642,22 @@ func parseChatRow(_ raw: String, allow: [String]) -> ChatRow? {
 struct Msg: Equatable {
     var type: String; var text: String
     var from: String? = nil, sender: String? = nil, wxid: String? = nil
+    var image: String? = nil, imageError: String? = nil
     var plain: Msg { Msg(type: type, text: text) }   // 拼接和对应时只比类型和内容
+
+    var dict: [String: String] {
+        var d = ["type": type, "text": text]
+        if let v = from { d["from"] = v }
+        if let v = sender, !v.isEmpty { d["sender"] = v }
+        if let v = wxid, !v.isEmpty { d["wxid"] = v }
+        if let v = image { d["image"] = v }
+        if let v = imageError { d["image_error"] = v }
+        return d
+    }
 }
 
 let MSG_TIME = #"^(\d{1,2}:\d{2}|昨天.*|前天.*|星期.*|周.*|\d{1,2}月\d{1,2}日.*|\d{4}年.*|\d{1,2}/\d{1,2}.*)$"#
 
-/// 往上翻一页后，把新看到的一页拼到已有记录前面：找新一页尾部和已有记录头部的最长重叠
-func prependPage(_ all: [Msg], _ page: [Msg]) -> [Msg]? {
-    if all.isEmpty { return page }
-    for k in stride(from: min(page.count, all.count), through: 1, by: -1)
-        where Array(page.suffix(k)) == Array(all.prefix(k)) {
-        return Array(page.dropLast(k)) + all
-    }
-    return nil
-}
 
 /// 定位点（上次读到的最后几条消息）之后的记录；找不到定位点返回 nil
 func afterAnchor(_ all: [Msg], _ anchor: [String]) -> [Msg]? {
@@ -579,6 +670,55 @@ func afterAnchor(_ all: [Msg], _ anchor: [String]) -> [Msg]? {
     }
     return nil
 }
+
+// MARK: - 对位（纯函数）
+
+/// 屏幕上这一页在 all 里的起始下标：优先用上一页认得的行（known[k] 是第 k 行在 all 里的下标）；
+/// 认不出时按文字找，只接受唯一的位置；第一页（hi == all.count）必须对上末尾。对不上返回 nil
+func alignPage(_ all: [Msg], _ page: [Msg], hi: Int, known: [Int?]) -> Int? {
+    let n = page.count
+    guard n > 0, n <= all.count else { return nil }
+    func fits(_ j: Int) -> Bool { j >= 0 && j + n <= all.count && all[j..<(j + n)].map { $0.plain } == page }
+    if let k = known.firstIndex(where: { $0 != nil }), let i = known[k] {
+        return fits(i - k) ? i - k : nil
+    }
+    if hi >= all.count { return fits(all.count - n) ? all.count - n : nil }
+    let hits = stride(from: min(hi, all.count) - n, through: 0, by: -1).filter(fits)
+    return hits.count == 1 ? hits[0] : nil
+}
+
+/// 往上翻一页后，把新看到的一页拼到已有记录前面：找新一页尾部和已有记录头部的最长重叠
+func prependPage(_ all: [Msg], _ page: [Msg]) -> [Msg]? {
+    if all.isEmpty { return page }
+    for k in stride(from: min(page.count, all.count), through: 1, by: -1)
+        where Array(page.suffix(k)) == Array(all.prefix(k)) {
+        return Array(page.dropLast(k)) + all
+    }
+    return nil
+}
+
+/// 往上翻了一页后，把新露出来的行接到 all 前面：known[k] 表示第 k 行在上一页见过（按行元素认），
+/// 第一行见过的就是 all[0]，它前面的都是新行；认不出行元素时退回按文字重叠
+func prependRows(_ all: [Msg], _ page: [Msg], known: [Bool]) -> [Msg]? {
+    guard !all.isEmpty else { return page }
+    guard let k = known.firstIndex(of: true) else { return prependPage(all, page) }
+    let rest = Array(page[k...])
+    guard rest.count <= all.count, Array(all.prefix(rest.count)) == rest else { return nil }
+    return Array(page.prefix(k)) + all
+}
+
+/// 会话列表这一行是否显示为未读：「N条未读」或免打扰群的「[N条]」，要是单独的一段，预览里恰好出现这几个字不算
+func showsUnread(_ raw: String) -> Bool {
+    raw.range(of: #"(^| )(\d+条未读|\[\d+条\])( |$)"#, options: .regularExpression) != nil
+}
+
+/// 这一行的聊天名是不是正好是 name：名字后面紧跟「已置顶」或未读标记时才能确定（会话行只有一整段文字，分不出名字在哪结束）
+func rowNamed(_ raw: String, _ name: String) -> Bool {
+    guard raw.hasPrefix(name + " ") else { return false }
+    return raw.dropFirst(name.count + 1).range(of: #"^(已置顶|\d+条未读|\[\d+条\])( |$)"#, options: .regularExpression) != nil
+}
+
+// MARK: - 对位结束
 
 /// 会话列表的预览是不是就是这条消息（群里的预览是「发送人: 内容」，图片是「[图片]」）
 func previewIs(_ preview: String, _ text: String) -> Bool {
@@ -958,7 +1098,9 @@ final class Session {
 
     /// 在会话列表里找到这一行并点开，点开后核对标题
     func openRow(_ name: String, _ allow: [String]) throws {
-        guard let row = findRow({ parseChatRow($0, allow: allow)?.name == name || $0.hasPrefix(name + " ") }) else {
+        // 先按能确定的名字找，找不到再退回「名字开头」（有「Tom」和「Tom Huang」时后者可能认错）
+        guard let row = findRow({ parseChatRow($0, allow: allow)?.name == name || rowNamed($0, name) })
+                ?? findRow({ $0.hasPrefix(name + " ") }) else {
             throw fail(2, "NOT_FOUND", "会话列表里找不到「\(name)」")
         }
         try guardFront()
@@ -984,7 +1126,8 @@ final class Session {
 
     /// 右键这一行 →「标为未读」。菜单项不支持 AX 按下，只能点击：点击前核对该位置确实是「标为未读」（同一菜单里有「删除」）
     func markUnread(_ name: String) throws -> Bool {
-        guard let row = findRow({ $0.hasPrefix(name + " ") }) else { return false }
+        guard let row = findRow({ rowNamed($0, name) }) ?? findRow({ $0.hasPrefix(name + " ") }) else { return false }
+        if showsUnread(row.raw) { return true }   // 读完后又来了新消息，本来就是未读
         try guardFront()
         for t: CGEventType in [.mouseMoved, .rightMouseDown, .rightMouseUp] {
             CGEvent(mouseEventSource: nil, mouseType: t, mouseCursorPosition: row.center, mouseButton: .right)?.post(tap: .cghidEventTap)
@@ -1004,21 +1147,23 @@ final class Session {
         return waitUntil(1, 0.1) {
             (axChatList().map { axChildren($0) } ?? []).contains {
                 let t = axStr($0, kAXTitleAttribute) ?? ""
-                return t.hasPrefix(name + " ") && t.contains("条未读")
+                return t.hasPrefix(name + " ") && showsUnread(t)
             }
         }
     }
 
-    /// 屏幕上能看到的消息行（按从上到下），带位置
-    func visibleRows(_ list: AXUIElement) -> [(msg: Msg, frame: CGRect, raw: String)] {
+    typealias Row = (msg: Msg, frame: CGRect, raw: String, el: AXUIElement)
+
+    /// 屏幕上能看到的消息行（按从上到下），带位置和 AX 元素
+    func visibleRows(_ list: AXUIElement) -> [Row] {
         guard let box = axFrame(list) else { return [] }
-        return axChildren(list).compactMap { e -> (Msg, CGRect, String)? in
+        return axChildren(list).compactMap { e -> Row? in
             guard let raw = axStr(e, kAXTitleAttribute), !raw.isEmpty, let f = axFrame(e), f.height > 0, f.intersects(box) else { return nil }
             var t = raw
             if t.hasSuffix(" ") { t.removeLast() }
             let isTime = f.height < 50 && t.range(of: MSG_TIME, options: .regularExpression) != nil
-            return (Msg(type: isTime ? "time" : "message", text: t), f, raw)
-        }.sorted { $0.1.minY < $1.1.minY }
+            return (Msg(type: isTime ? "time" : "message", text: t), f, raw, e)
+        }.sorted { $0.frame.minY < $1.frame.minY }
     }
 
     func scrollListToBottom(_ list: AXUIElement) {
@@ -1060,33 +1205,133 @@ final class Session {
         return (name, wxid)
     }
 
-    /// 给 all[start...] 里的消息识别发送人：滚到底，一页页往上，把屏幕上的行对应回记录，点头像
-    func identifySenders(_ list: AXUIElement, _ all: inout [Msg], _ start: Int) throws {
+    /// 滚到底，一页页往上，把屏幕上的行对应回 all 里的下标，对下标 >= start 的行调用 act
+    func walkRows(_ list: AXUIElement, _ all: inout [Msg], _ start: Int, _ act: (Int, Row, inout [Msg]) throws -> Void) throws {
         guard start < all.count, let box = axFrame(list) else { return }
         scrollListToBottom(list)
         var hi = all.count
-        for _ in 0..<15 {
+        var seen: [(el: AXUIElement, i: Int)] = []   // 上一页每一行的元素和下标：同名的「图片」行只能靠元素区分
+        var last = Int.max
+        while true {
             let rows = visibleRows(list)
-            let page = rows.map { $0.msg.plain }
-            guard !page.isEmpty, let j = stride(from: min(hi, all.count) - page.count, through: 0, by: -1)
-                    .first(where: { j in j >= 0 && all[j..<(j + page.count)].map { $0.plain } == page }) else { return }
-            for (k, row) in rows.enumerated().reversed() {
-                let i = j + k
-                guard i >= start, all[i].type == "message", all[i].from == nil else { continue }
-                let f = row.frame
-                if let c = try probeAvatar(CGPoint(x: f.minX + 38, y: f.minY + 28), row.raw, box) {
-                    all[i].from = "other"; all[i].sender = c.name; all[i].wxid = c.wxid
-                } else if let c = try probeAvatar(CGPoint(x: f.maxX - 38, y: f.minY + 28), row.raw, box) {
-                    all[i].from = "me"; all[i].sender = c.name; all[i].wxid = c.wxid
-                } else if box.contains(CGPoint(x: f.minX + 38, y: f.minY + 28)) {
-                    all[i].from = "system"
-                }
+            let known = rows.map { r in seen.first { CFEqual($0.el, r.el) }?.i }
+            guard let j = alignPage(all, rows.map { $0.msg.plain }, hi: hi, known: known) else {
+                throw fail(4, "ALIGN", "滚动后对不上消息的位置，更早的消息没有处理")
             }
+            if j >= last { throw fail(4, "ALIGN", "往上翻不动了，更早的消息没有处理") }
+            last = j
+            for (k, row) in rows.enumerated().reversed() where j + k >= start {
+                try act(j + k, row, &all)
+            }
+            seen = rows.enumerated().map { ($0.element.el, j + $0.offset) }
             if j <= start { return }
-            hi = j + page.count - 1
+            hi = j + rows.count - 1
             try guardFront()
             scrollList(list, Int32(box.height * 0.6))
         }
+    }
+
+    /// 点这一行的头像识别发送人
+    func identifySender(_ i: Int, _ row: Row, _ msgs: inout [Msg], _ box: CGRect) throws {
+        guard msgs[i].type == "message", msgs[i].from == nil else { return }
+        let f = row.frame
+        if let c = try probeAvatar(CGPoint(x: f.minX + 38, y: f.minY + 28), row.raw, box) {
+            msgs[i].from = "other"; msgs[i].sender = c.name; msgs[i].wxid = c.wxid
+        } else if let c = try probeAvatar(CGPoint(x: f.maxX - 38, y: f.minY + 28), row.raw, box) {
+            msgs[i].from = "me"; msgs[i].sender = c.name; msgs[i].wxid = c.wxid
+        } else if box.contains(CGPoint(x: f.minX + 38, y: f.minY + 28)) {
+            msgs[i].from = "system"
+        }
+    }
+
+    var imagesTaken = 0, imagesSkipped = 0
+    var cursorsToSave: [(String, [Msg])] = []   // 成功输出结果后才保存，中途退出时下次还能读到这些消息
+
+    /// 这一行是图片就复制出来存进 inbox；超过张数上限的只计数
+    func takeImage(_ i: Int, _ row: Row, _ msgs: inout [Msg]) throws {
+        guard msgs[i].type == "message", msgs[i].text == "图片", msgs[i].image == nil, msgs[i].imageError == nil else { return }
+        if imagesTaken >= MAX_IMAGES { imagesSkipped += 1; return }
+        imagesTaken += 1
+        do { msgs[i].image = try copyImage(row, side: msgs[i].from) }
+        catch let e as WXError where e.code == 5 || e.code == 6 { throw e }
+        catch let e as WXError { msgs[i].imageError = e.msg }
+    }
+
+    /// 右键这张图 →「复制」→ 存进 inbox，返回文件名
+    func copyImage(_ row: Row, side: String?) throws -> String {
+        if INBOX.isEmpty { throw fail(4, "NO_INBOX", "没有设置 WX_INBOX") }
+        let f = row.frame
+        // 行可能一部分在列表外（被标题栏挡住），只在露出来的部分上点
+        let v = axMessageList().flatMap { axFrame($0) }.map { f.intersection($0) } ?? f
+        if v.height < 30 { throw fail(4, "OFFSCREEN", "图片只露出一小部分，没取") }
+        // 不知道是谁发的就先左后右：右键到空白处不会弹菜单
+        let left = CGPoint(x: f.minX + IMG_DX, y: v.midY), right = CGPoint(x: f.maxX - IMG_DX, y: v.midY)
+        let points = side == "me" ? [right] : side == "other" ? [left] : [left, right]
+        for pt in points {
+            if let name = try copyAt(pt, row) { return name }
+        }
+        throw fail(4, "NO_COPY", "没能在这张图上右键点出「复制」")
+    }
+
+    /// 在 pt 右键并点「复制」，等剪贴板出现图片后存进 inbox；这个位置不在这一行上、或菜单里没有「复制」时返回 nil
+    func copyAt(_ pt: CGPoint, _ row: Row) throws -> String? {
+        var hit: AXUIElement?
+        AXUIElementCopyElementAtPosition(AXUIElementCreateSystemWide(), Float(pt.x), Float(pt.y), &hit)
+        guard let h = hit, isInside(h, row.el) else { return nil }
+        try guardFront()
+        let pb = NSPasteboard.general
+        let before = pb.changeCount
+        for t: CGEventType in [.mouseMoved, .rightMouseDown, .rightMouseUp] {
+            CGEvent(mouseEventSource: nil, mouseType: t, mouseCursorPosition: pt, mouseButton: .right)?.post(tap: .cghidEventTap)
+            usleep(t == .mouseMoved ? 25_000 : 35_000)
+        }
+        var item: AXUIElement?
+        _ = waitUntil(1, 0.05) {
+            item = contextMenuItems().first { axStr($0, kAXTitleAttribute) == COPY_TITLE }
+            return item != nil
+        }
+        guard let it = item, let r = axFrame(it) else { try closeMenu(); return nil }
+        let p = CGPoint(x: r.midX, y: r.midY)
+        var onItem: AXUIElement?
+        AXUIElementCopyElementAtPosition(AXUIElementCreateSystemWide(), Float(p.x), Float(p.y), &onItem)
+        guard let o = onItem, axRole(o) == "AXMenuItem", axStr(o, kAXTitleAttribute) == COPY_TITLE else {
+            try closeMenu(); return nil
+        }
+        click(p)
+        try closeMenu()   // 点击后菜单通常已经关了，这里兜底
+        var got: (Data, String)?
+        _ = waitUntil(IMAGE_WAIT, 0.1) {
+            guard pb.changeCount != before else { return false }
+            got = imageFromPasteboard(pb)
+            return got != nil
+        }
+        guard let (data, ext) = got else { throw fail(4, "NO_IMAGE", "点了「复制」，但 \(Int(IMAGE_WAIT)) 秒内剪贴板里没有图片") }
+        return try saveInbox(data, ext)
+    }
+
+    func closeMenuQuietly() { for _ in 0..<3 where !contextMenuItems().isEmpty { key(K_ESC); usleep(200_000) } }
+
+    /// 关掉还开着的右键菜单；连按 3 次 Esc 还关不掉就停止，防止后面误点
+    func closeMenu() throws {
+        for _ in 0..<3 where !contextMenuItems().isEmpty {
+            key(K_ESC)
+            _ = waitUntil(0.5, 0.05) { contextMenuItems().isEmpty }
+        }
+        if !contextMenuItems().isEmpty { throw fail(5, "MENU_OPEN", "右键菜单关不掉，为防误点已停止") }
+    }
+
+    /// 存进 inbox，文件名 in-时间-序号.扩展名
+    func saveInbox(_ data: Data, _ ext: String) throws -> String {
+        try? FileManager.default.createDirectory(atPath: INBOX, withIntermediateDirectories: true)
+        let fmt = DateFormatter()
+        fmt.locale = Locale(identifier: "en_US_POSIX")
+        fmt.dateFormat = "yyyyMMdd-HHmmss"
+        let stamp = fmt.string(from: Date())
+        var n = 1, name = ""
+        repeat { name = "in-\(stamp)-\(n).\(ext)"; n += 1 } while FileManager.default.fileExists(atPath: INBOX + "/" + name)
+        do { try data.write(to: URL(fileURLWithPath: INBOX + "/" + name)) }
+        catch { throw fail(4, "INBOX_WRITE", "图片存不进 \(INBOX)：\(error.localizedDescription)") }
+        return name
     }
 
     /// 读这个聊天的新消息：有读取进度就读到定位点为止，没有就读最近 unread 条；最多 maxMsgs 条
@@ -1094,7 +1339,8 @@ final class Session {
         guard let list = axMessageList(), let box = axFrame(list) else { throw fail(5, "NO_AX", "AX 读不到聊天记录") }
         _ = waitUntil(1, 0.1) { !visibleMessages(list).isEmpty }
         let anchor = loadCursor(r.name) ?? []
-        var all = visibleMessages(list)
+        var rows = visibleRows(list)
+        var all = rows.map { $0.msg }
         func count(_ m: [Msg]) -> Int { m.filter { $0.type == "message" }.count }
         var result: [Msg]? = nil, note: String? = nil
         for _ in 0..<15 {
@@ -1103,8 +1349,12 @@ final class Session {
             if count(all) >= maxMsgs { break }
             try guardFront()
             scrollList(list, Int32(box.height * 0.7))
-            guard let merged = prependPage(all, visibleMessages(list)), merged.count > all.count else { break }   // 到顶了
+            // 连着几条内容一样的消息（比如一串「图片」）只能靠行元素判断翻过了几行
+            let page = visibleRows(list)
+            let known = page.map { r in rows.contains { CFEqual($0.el, r.el) } }
+            guard let merged = prependRows(all, page.map { $0.msg }, known: known), merged.count > all.count else { break }   // 到顶了
             all = merged
+            rows = page
         }
         if result == nil {
             if !anchor.isEmpty { note = "没找到上次读到的位置，可能有更早的新消息没读到" }
@@ -1118,69 +1368,122 @@ final class Session {
             }
             result = Array(all[start...])
         }
-        saveCursor(r.name, all)
+        cursorsToSave.append((r.name, all))
         let final = Array(result!.suffix(maxMsgs * 2))
-        if SENDERS && group {   // 私聊的发送人就是这个聊天本身，不用点头像
-            do { try identifySenders(list, &all, all.count - final.count) }
-            catch let e as WXError where e.code == 6 { throw e }
-            catch let e as WXError { return (Array(all.suffix(final.count)), (note.map { $0 + "；" } ?? "") + "识别发送人中断：" + e.msg) }
+        let senders = SENDERS && group   // 私聊的发送人就是这个聊天本身，不用点头像
+        if senders || IMAGES {
+            do {
+                try walkRows(list, &all, all.count - final.count) { i, row, msgs in
+                    if senders { try identifySender(i, row, &msgs, box) }
+                    if IMAGES { try takeImage(i, row, &msgs) }
+                }
+            }
+            catch let e as WXError where e.code == 6 || e.tag == "MENU_OPEN" { throw e }
+            catch let e as WXError { return (Array(all.suffix(final.count)), (note.map { $0 + "；" } ?? "") + "逐条处理中断：" + e.msg) }
         }
         return (Array(all.suffix(final.count)), note)
     }
 
-    /// 读所有要读的未读聊天；读完切回原来打开的聊天
+    // 读了谁就要未读谁：点开前记账，标回未读后才销账；账本跨进程保留，被打断时下次调用补标
+    var owedPath: String { CACHE + "/remark-" + account + ".json" }
+    func loadOwed() -> [String: Int] {
+        (try? Data(contentsOf: URL(fileURLWithPath: owedPath))).flatMap { try? JSONSerialization.jsonObject(with: $0) as? [String: Int] } ?? [:]
+    }
+    func saveOwed(_ owed: [String: Int]) {
+        if owed.isEmpty { try? FileManager.default.removeItem(atPath: owedPath); return }
+        if let d = try? JSONSerialization.data(withJSONObject: owed) { try? d.write(to: URL(fileURLWithPath: owedPath), options: .atomic) }
+    }
+
+    /// 标回未读，失败再试 2 次；微信被切走时不再重试
+    func remark(_ name: String) -> Bool {
+        for k in 0..<3 {
+            if (try? markUnread(name)) == true { return true }
+            if !isFront() { return false }
+            if k < 2 { usleep(400_000) }
+        }
+        return false
+    }
+
+    /// 把账上的聊天逐个标回未读（当前停在文件传输助手上）；返回标回了的名字
+    func payOwed(_ owed: inout [String: Int]) -> [String] {
+        var done: [String] = []
+        for name in owed.keys.sorted() {
+            if sameName(HOME_CHAT, name) || remark(name) { owed[name] = nil; done.append(name); saveOwed(owed) }
+        }
+        return done
+    }
+
+    /// 读所有要读的未读聊天；读完切到文件传输助手
     func printUnreadDetails(_ allow: [String], _ maxChats: Int, _ maxMsgs: Int) throws {
-        // 先切到前台，AX 树才有内容，才能记下原来打开的聊天
+        imagesTaken = 0; imagesSkipped = 0; cursorsToSave = []
+        // 先切到前台，AX 树才有内容
         try activate()
         W = try ensureWindow()
         _ = waitUntil(1, 0.1) { axTitle() != nil }
-        let original = axTitle().map { stripCount($0) }
+        var notes: [String] = []
+        // 上次被打断、没来得及标回未读的聊天，先补标，这样它们会重新出现在未读列表里
+        var owed = loadOwed()
+        let owedCounts = owed
+        if REMARK && !owed.isEmpty {
+            var n: [String] = []
+            if (try? openChat(HOME_CHAT, &n)) != nil {
+                let done = payOwed(&owed)
+                if !done.isEmpty { notes.append("补标了上次没标回未读的：" + done.joined(separator: "、")) }
+            }
+        }
         let (total, rows, scanned) = try scanUnread(allow)
         var chats: [[String: Any]] = [], skipped: [String] = []
-        for r in rows.prefix(maxChats) {
+        for var r in rows.prefix(maxChats) {
             if let a = loadCursor(r.name), let last = a.last, previewIs(r.preview, last) { skipped.append(r.name); continue }
+            // 标回未读后只显示「1条未读」，按账上记的原始条数读
+            r.unread = max(r.unread, owedCounts[r.name] ?? 0)
             var item: [String: Any] = ["name": r.name, "unread": r.unread, "pinned": r.pinned, "muted": r.muted, "time": r.time]
+            if REMARK { owed[r.name] = max(owed[r.name] ?? 0, r.unread); saveOwed(owed) }   // 点开前先记账
             do {
                 try openRow(r.name, allow)
                 let group = isGroupChat()
                 item["group"] = group
                 let (msgs, note) = try readNew(r, maxMsgs, group: group)
-                item["messages"] = msgs.map { m -> [String: String] in
-                    var d = ["type": m.type, "text": m.text]
-                    if let v = m.from { d["from"] = v }
-                    if let v = m.sender, !v.isEmpty { d["sender"] = v }
-                    if let v = m.wxid, !v.isEmpty { d["wxid"] = v }
-                    return d
-                }
+                item["messages"] = msgs.map { $0.dict }
                 item["new"] = msgs.filter { $0.type == "message" }.count
                 if let n = note { item["note"] = n }
             } catch let e as WXError {
-                if e.code == 6 { throw e }
+                if e.code == 6 || e.tag == "MENU_OPEN" {   // 菜单还开着或被切走：不再往下读
+                    // 微信还在最前面就先标回去；被切走了就不抢焦点，留在账上下次补标
+                    if REMARK && e.code != 6 && isFront() {
+                        closeMenuQuietly()
+                        var n: [String] = []
+                        if (try? openChat(HOME_CHAT, &n)) != nil { _ = payOwed(&owed) }
+                    }
+                    throw e
+                }
                 item["error"] = e.msg
+                // 点开的不是这个聊天：实际打开的那个也要记账，之后一起标回未读
+                if REMARK, e.tag == "TITLE_MISMATCH", let t = axTitle().map({ stripCount($0) }), !t.isEmpty, !sameName(t, r.name) {
+                    owed[t] = max(owed[t] ?? 0, 1); saveOwed(owed)
+                }
             }
             chats.append(item)
         }
-        var notes: [String] = []
         if rows.count > maxChats { notes.append("未读聊天有 \(rows.count) 个，只读了前 \(maxChats) 个") }
-        let opened = chats.filter { $0["messages"] != nil }.compactMap { $0["name"] as? String }
-        // 切回原来的聊天；原来没打开聊天的话，切到一个本来就没有未读的聊天，这样读过的聊天都能标回未读
+        if imagesSkipped > 0 { notes.append("图片超过 \(MAX_IMAGES) 张，有 \(imagesSkipped) 张没取（WX_MAX_IMAGES）") }
+        // 读完固定切到文件传输助手：真实聊天一直开着的话，新消息会直接变成已读；切走后读过的聊天才能标回未读
         var back = false
-        if let o = original, !o.isEmpty {
-            do { var n: [String] = []; try openChat(o, &n); back = true } catch { notes.append("没能切回原来的聊天「\(o)」") }
-        } else if !opened.isEmpty, let row = findRow({ raw in !raw.contains("条未读") && raw.range(of: #"\[\d+条\]"#, options: .regularExpression) == nil
-                                                     && !opened.contains(where: { raw.hasPrefix($0 + " ") }) }) {
-            click(row.center); usleep(500_000); back = true
-        }
+        do { var n: [String] = []; try openChat(HOME_CHAT, &n); back = true }
+        catch let e as WXError { notes.append("没能切到「\(HOME_CHAT)」：\(e.msg)") }
         if REMARK && back {
-            for i in chats.indices where chats[i]["messages"] != nil {
+            // 这次点开过的聊天（包括读的时候出错的）都要标回；文件传输助手自己读完就停在上面，不标
+            let done = Set(payOwed(&owed))
+            for i in chats.indices where chats[i]["messages"] != nil || chats[i]["error"] != nil {
                 let name = chats[i]["name"] as! String
-                if let o = original, sameName(o, name) { chats[i]["remarked_unread"] = false; continue }
-                chats[i]["remarked_unread"] = (try? markUnread(name)) ?? false
+                chats[i]["remarked_unread"] = done.contains(name) && !sameName(HOME_CHAT, name)
             }
         }
+        if !owed.isEmpty { notes.append("没能标回未读，下次调用会补标：" + owed.keys.sorted().joined(separator: "、")) }
         let out: [String: Any] = ["total": total, "scanned": scanned, "chats": chats, "skipped_no_new": skipped, "notes": notes]
         let data = try JSONSerialization.data(withJSONObject: out, options: [.sortedKeys])
         say(String(data: data, encoding: .utf8)!)
+        for (name, all) in cursorsToSave { saveCursor(name, all) }
     }
 
     // MARK: 好友申请
@@ -1317,7 +1620,7 @@ final class Session {
         }
         if !DRY_RUN { rateLimit(account) }
         let t0 = Date()
-        let (st, info) = try sendInChat(name, msg, ["新好友打招呼"])
+        let (st, info) = try sendInChat(name, .text(msg), ["新好友打招呼"])
         writeLog(account, name, st, String(format: "%.1f", Date().timeIntervalSince(t0)), info, msg)
         return st
     }
@@ -1451,38 +1754,104 @@ final class Session {
         }
     }
 
-    /// 读取聊天记录里当前加载出来的消息（最多 limit 条），JSON 输出
+    /// send / read / whois 做完切回文件传输助手：停在客户的聊天上，他紧接着回的消息会直接变成已读，也不发通知
+    func park() {
+        guard isFront() else { return }   // 被切走了就不抢焦点
+        var n: [String] = []
+        do { try openChat(HOME_CHAT, &n) } catch {
+            if inSearch && isFront() { key(K_ESC) }
+            inSearch = false
+            eprint("⚠️ 没能切回「\(HOME_CHAT)」：\((error as? WXError)?.msg ?? "\(error)")")
+        }
+    }
+
+    /// 私聊里从最新往上找对方发的消息，点他的头像读出昵称和微信号，JSON 输出
+    func whois(_ contact: String) throws {
+        var notes: [String] = []
+        try openChat(contact, &notes)
+        if isGroupChat() { throw fail(4, "IS_GROUP", "「\(contact)」是群聊，只能查私聊联系人的微信号") }
+        guard let list = axMessageList(), let box = axFrame(list) else { throw fail(5, "NO_AX", "AX 读不到聊天记录") }
+        _ = waitUntil(1, 0.1) { !visibleRows(list).isEmpty }
+        scrollListToBottom(list)
+        var tried: [AXUIElement] = []   // 点过头像的行；头像没露出来的行翻页后再试
+        var top: AXUIElement?, stalls = 0
+        while true {
+            let rows = visibleRows(list)
+            for row in rows.reversed() where row.msg.type == "message" && !tried.contains(where: { CFEqual($0, row.el) }) {
+                let pt = CGPoint(x: row.frame.minX + 38, y: row.frame.minY + 28)   // 私聊里对方的头像在左边
+                guard box.contains(pt) else { continue }
+                tried.append(row.el)
+                guard let c = try probeAvatar(pt, row.raw, box) else { continue }
+                if c.wxid.isEmpty { throw fail(4, "NO_WXID", "「\(c.name)」的资料卡上没有微信号") }
+                let out: [String: Any] = ["chat": contact, "name": c.name, "wxid": c.wxid, "notes": notes]
+                let data = try JSONSerialization.data(withJSONObject: out, options: [.sortedKeys])
+                say(String(data: data, encoding: .utf8)!)
+                return
+            }
+            // 首行没变就是没翻动；等微信加载更早的消息再试一次，还是没变就是到顶了
+            if let t = top, let f = rows.first, CFEqual(t, f.el) {
+                stalls += 1
+                if stalls > 1 { throw fail(4, "NO_OTHER", "「\(contact)」的聊天里找不到对方发的消息，没法点他的头像") }
+                usleep(800_000)
+            } else { stalls = 0 }
+            top = rows.first?.el
+            try guardFront()
+            scrollList(list, Int32(box.height * 0.7))
+        }
+    }
+
+    /// 从底部往上翻着读聊天记录（最多 limit 条），JSON 输出；WX_IMAGES=1 时顺便取图
     func readChat(_ contact: String, _ limit: Int) throws {
         var notes: [String] = []
         try openChat(contact, &notes)
-        guard let list = axChatPane().flatMap({ p in axChildren(p).first { axRole($0) == "AXList" } }) else {
-            throw fail(5, "NO_AX", "AX 读不到聊天记录")
+        guard let list = axMessageList(), let box = axFrame(list) else { throw fail(5, "NO_AX", "AX 读不到聊天记录") }
+        _ = waitUntil(1, 0.1) { !visibleRows(list).isEmpty }
+        scrollListToBottom(list)
+        // 屏幕外的消息是没有内容的占位元素，读不到，只能从底部一页页往上翻着读
+        var rows = visibleRows(list)
+        var items = rows.map { $0.msg }
+        var stalls = 0
+        while items.count < limit {
+            try guardFront()
+            scrollList(list, Int32(box.height * 0.7))
+            let page = visibleRows(list)
+            let known = page.map { r in rows.contains { CFEqual($0.el, r.el) } }
+            guard let merged = prependRows(items, page.map { $0.msg }, known: known) else {
+                notes.append("往上翻时对不上消息的位置，更早的消息没读到"); break
+            }
+            if merged.count == items.count {
+                // 翻到已加载的顶部时微信会再加载一批更早的，等一下再翻一次；还是没有新行就是到顶了
+                stalls += 1
+                if stalls > 1 { break }
+                usleep(800_000)
+                continue
+            }
+            stalls = 0
+            items = merged
+            rows = page
         }
-        let time = #"^(\d{1,2}:\d{2}|昨天.*|前天.*|星期.*|周.*|\d{1,2}月\d{1,2}日.*|\d{4}年.*|\d{1,2}/\d{1,2}.*)$"#
-        var items: [[String: String]] = []
-        for row in axChildren(list) {
-            // 屏幕外的消息是没有内容的占位元素，读不到
-            guard var t = axStr(row, kAXTitleAttribute), !t.isEmpty else { continue }
-            if t.hasSuffix(" ") { t.removeLast() }
-            let h = axFrame(row)?.height ?? 0
-            let isTime = h < 50 && t.range(of: time, options: .regularExpression) != nil
-            items.append(["type": isTime ? "time" : "message", "text": t])
+        if IMAGES {
+            imagesTaken = 0; imagesSkipped = 0
+            do { try walkRows(list, &items, max(0, items.count - limit)) { i, row, msgs in try takeImage(i, row, &msgs) } }
+            catch let e as WXError where e.code == 6 || e.tag == "MENU_OPEN" { throw e }
+            catch let e as WXError { notes.append("取图中断：" + e.msg) }
+            if imagesSkipped > 0 { notes.append("图片超过 \(MAX_IMAGES) 张，有 \(imagesSkipped) 张没取（WX_MAX_IMAGES）") }
         }
-        let out: [String: Any] = ["chat": contact, "items": Array(items.suffix(limit)), "notes": notes]
+        let out: [String: Any] = ["chat": contact, "items": items.suffix(limit).map { $0.dict }, "notes": notes]
         let data = try JSONSerialization.data(withJSONObject: out, options: [.sortedKeys])
         say(String(data: data, encoding: .utf8)!)
     }
 
     /// 返回 (状态, 说明)。状态：SENT / DRY_RUN / FAILED / UNCONFIRMED
-    func sendOne(_ contact: String, _ msg: String) throws -> (String, String) {
-        if msg.isEmpty { throw fail(64, "EMPTY_MSG", "消息是空的") }
+    func sendOne(_ contact: String, _ out: Outgoing) throws -> (String, String) {
+        if case .text(let s) = out, s.isEmpty { throw fail(64, "EMPTY_MSG", "消息是空的") }
         var notes: [String] = []
         try openChat(contact, &notes)
-        return try sendInChat(contact, msg, notes)
+        return try sendInChat(contact, out, notes)
     }
 
     /// 在已经打开的聊天里发送（聊天标题已经核对过）
-    func sendInChat(_ contact: String, _ msg: String, _ notesIn: [String]) throws -> (String, String) {
+    func sendInChat(_ contact: String, _ out: Outgoing, _ notesIn: [String]) throws -> (String, String) {
         var notes = notesIn
         W = try ensureWindow()
 
@@ -1501,14 +1870,18 @@ final class Session {
             if !draft.isEmpty {
                 throw fail(7, "DRAFT", "「\(contact)」的输入框里已有内容「\(preview(draft, 20))」，为免连草稿一起发出已停止。请清空后重试")
             }
-            pasteText(msg)
+            out.paste()
             var seen = ""
-            let inBox = waitUntil(1.5, 0.05) {
+            let inBox = waitUntil(out.isImage ? 3 : 1.5, 0.05) {
                 seen = axStr(box, kAXValueAttribute) ?? ""
-                return sameInput(seen, msg)
+                return out.inBox(seen)
             }
             if !inBox { throw fail(4, "INPUT_MISMATCH", "粘贴后输入框里是「\(preview(seen, 20))」，和消息不一致，已停止，未发送") }
         } else {
+            // 截图识别认不出图片，不核对就不发
+            guard case .text(let msg) = out else {
+                throw fail(4, "NO_AX_INPUT", "AX 读不到输入框，无法核对图片，已停止，未发送")
+            }
             notes.append("AX 读不到输入框，改用截图识别")
             let draft = try inputText()
             if !draft.isEmpty {
@@ -1536,16 +1909,20 @@ final class Session {
         if !CONFIRM { return ("SENT", (notes + ["未做发送确认"]).joined(separator: "；")) }
 
         // 4. 确认：「消息」列表多了一行、内容就是这条消息，输入框已清空，旁边没有红色感叹号
+        let wait: Double = out.isImage ? 10 : 3
         if let list = msgList, let box = axInput() {
             var lastSeen = ""
-            let end = Date().addingTimeInterval(3)
+            let end = Date().addingTimeInterval(wait)
             repeat {
                 let rows = axChildren(list)
                 if let row = rows.last {
                     lastSeen = axStr(row, kAXTitleAttribute) ?? ""
                     if lastSeen.hasSuffix(" ") { lastSeen.removeLast() }   // 微信在每条消息后面加了一个空格
                     let isNew = rows.count != rowsBefore.count || rowsBefore.last.map { !CFEqual($0, row) } ?? true
-                    if isNew && sameInput(lastSeen, msg) && (axStr(box, kAXValueAttribute) ?? "x").isEmpty {
+                    if isNew && out.isSentRow(lastSeen) && (axStr(box, kAXValueAttribute) ?? "x").isEmpty {
+                        guard case .text(let msg) = out else {
+                            return ("SENT", (notes + ["未检测发送失败标记"]).joined(separator: "；"))
+                        }
                         if redMarkByOCR(norm(msg)) {
                             return ("FAILED", (notes + ["消息旁出现红色感叹号，发送失败"]).joined(separator: "；"))
                         }
@@ -1554,10 +1931,13 @@ final class Session {
                 }
                 sleepS(0.1)
             } while Date() < end
-            return ("UNCONFIRMED", (notes + ["3 秒内没在聊天记录最后看到这条消息（最后一条：「\(preview(lastSeen, 20))」），可能已发出，请人工确认，不要直接重试"]).joined(separator: "；"))
+            return ("UNCONFIRMED", (notes + ["\(Int(wait)) 秒内没在聊天记录最后看到这条消息（最后一条：「\(preview(lastSeen, 20))」），可能已发出，请人工确认，不要直接重试"]).joined(separator: "；"))
         }
 
         // AX 不可用时：截图识别聊天底部
+        guard case .text(let msg) = out else {
+            return ("UNCONFIRMED", (notes + ["AX 读不到聊天记录，无法确认图片是否发出，请人工确认，不要直接重试"]).joined(separator: "；"))
+        }
         notes.append("AX 读不到聊天记录，改用截图识别确认")
         let g = norm(msg)
         if g.isEmpty { return ("SENT", (notes + ["消息没有文字，未做发送确认"]).joined(separator: "；")) }
@@ -1684,7 +2064,7 @@ func run(_ args: [String]) -> Int32 {
                 .map { $0.trimmingCharacters(in: .whitespaces) }.filter { !$0.isEmpty }
             let lockFd = try acquireLock()
             defer { close(lockFd) }
-            let clip = ClipboardBackup()   // 切回原聊天时会用搜索粘贴
+            let clip = ClipboardBackup()   // 切到文件传输助手时会用搜索粘贴
             clipBackup = clip
             let mouse = CGEvent(source: nil)?.location
             defer {
@@ -1695,8 +2075,9 @@ func run(_ args: [String]) -> Int32 {
             else { try session.printUnreadDetails(allow, Int(envD("WX_UNREAD_MAX_CHATS", 20)), Int(envD("WX_UNREAD_MAX_MSGS", 50))) }
             return 0
         }
-        if mode == "read" {
-            guard args.count == 5, let n = Int(args[4]), n > 0 else { eprint("内部参数错误"); return 64 }
+        if mode == "read" || mode == "whois" {
+            let n = mode == "whois" ? 1 : args.count == 5 ? Int(args[4]) ?? 0 : 0
+            guard args.count >= 4, n > 0 else { eprint("内部参数错误"); return 64 }
             let lockFd = try acquireLock()
             defer { close(lockFd) }
             let clip = ClipboardBackup()
@@ -1706,17 +2087,25 @@ func run(_ args: [String]) -> Int32 {
                 clip.restore()
                 if let m = mouse { moveMouse(m) }
             }
-            do { try session.readChat(args[3], n) } catch let e as WXError {
+            defer { session.park() }   // 后声明的先执行：切回时剪贴板还没恢复
+            do { if mode == "whois" { try session.whois(args[3]) } else { try session.readChat(args[3], n) } } catch let e as WXError {
                 if session.inSearch && session.isFront() { key(K_ESC) }
                 throw e
             }
             return 0
         }
 
-        let jobs: [(String, String)]
+        let jobs: [(String, Outgoing)]
         switch mode {
-        case "send" where args.count == 5: jobs = [(args[3], args[4])]
-        case "batch" where args.count == 4: jobs = try parseBatch(args[3])
+        case "send" where args.count == 5: jobs = [(args[3], .text(args[4]))]
+        case "image" where args.count == 5:
+            // 先确认文件是能读的图片，再去碰微信
+            guard let src = CGImageSourceCreateWithURL(URL(fileURLWithPath: args[4]) as CFURL, nil),
+                  CGImageSourceGetCount(src) > 0 else {
+                throw fail(64, "BAD_IMAGE", "读不了图片：\(args[4])")
+            }
+            jobs = [(args[3], .image(args[4]))]
+        case "batch" where args.count == 4: jobs = try parseBatch(args[3]).map { ($0.0, Outgoing.text($0.1)) }
         default: eprint("内部参数错误"); return 64
         }
 
@@ -1732,7 +2121,7 @@ func run(_ args: [String]) -> Int32 {
 
         var worst: Int32 = 0
         for (i, job) in jobs.enumerated() {
-            let (contact, msg) = job
+            let (contact, out) = job
             let tag = jobs.count > 1 ? "[\(i + 1)/\(jobs.count)] " : ""
             let t0 = Date()
             func secs() -> String { String(format: "%.1f", Date().timeIntervalSince(t0)) }
@@ -1744,9 +2133,9 @@ func run(_ args: [String]) -> Int32 {
                     rateLimit(account)
                 }
                 let t1 = Date()
-                let (st, info) = try session.sendOne(contact, msg)
+                let (st, info) = try session.sendOne(contact, out)
                 let s = String(format: "%.1f", Date().timeIntervalSince(t1))
-                writeLog(account, contact, st, s, info, msg)
+                writeLog(account, contact, st, s, info, out.logText)
                 let extra = info.isEmpty ? "" : "（\(info)）"
                 switch st {
                 case "SENT":        say("✅ \(tag)已发送给「\(contact)」，用时 \(s) 秒\(extra)")
@@ -1757,12 +2146,13 @@ func run(_ args: [String]) -> Int32 {
             } catch let e as WXError {
                 if session.inSearch && session.isFront() { key(K_ESC) }
                 session.inSearch = false
-                writeLog(account, contact, "FAILED:" + e.tag, secs(), e.msg, msg)
+                writeLog(account, contact, "FAILED:" + e.tag, secs(), e.msg, out.logText)
                 eprint("❌ \(tag)\(e.msg)")
                 worst = max(worst, e.code)
                 if e.code == 5 || e.code == 6 { break }   // 环境问题或被打断：后面的也不发了
             }
         }
+        if !DRY_RUN { session.park() }   // 试运行要让人看到输入框里的内容，不切走
         return worst
     } catch let e as WXError {
         writeLog(account, "-", "FAILED:" + e.tag, "0", e.msg, "")
@@ -1824,14 +2214,19 @@ case "$1" in
     fi ;;
 esac
 
+# ---------- 读图：图片存到仓库的 inbox/（由 bridge 负责清理，会跳过待处理消息还在用的图）----------
+export WX_INBOX="$(cd "$DIR/.." && pwd)/inbox"
+
 build
 
 case "$1" in
   --dump)  exec "$BIN" dump "$NAME" "$APP" ;;
   --batch) [[ $# -eq 2 ]] || usage; exec "$BIN" batch "$NAME" "$APP" "$2" ;;
   --read)  [[ $# -ge 2 && $# -le 3 ]] || usage; exec "$BIN" read "$NAME" "$APP" "$2" "${3:-20}" ;;
+  --whois) [[ $# -eq 2 ]] || usage; exec "$BIN" whois "$NAME" "$APP" "$2" ;;
   --friends) exec "$BIN" friends "$NAME" "$APP" "$([[ "${2:-}" == "--accept" ]] && echo accept || echo list)" ;;
   --unread) exec "$BIN" unread "$NAME" "$APP" "$([[ "${2:-}" == "--list-only" ]] && echo list || echo details)" ;;
+  --image) [[ $# -eq 3 ]] || usage; exec "$BIN" image "$NAME" "$APP" "$2" "$3" ;;
   -*)      usage ;;
   *)       [[ $# -eq 2 ]] || usage; exec "$BIN" send "$NAME" "$APP" "$1" "$2" ;;
 esac

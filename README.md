@@ -102,8 +102,13 @@ python3 mab.py scroll -5 640 400            # 在 (640,400) 处向下滚动
 python3 mab.py drag 100 100 300 300         # 拖拽
 python3 mab.py wechat-read "联系人" -n 10 -a work           # 读微信聊天记录（见下文）
 python3 mab.py wechat-send "联系人" "内容" -a work          # 发微信；加 --dry-run 只粘贴不发送
+python3 mab.py wechat-send "联系人" --image photo.jpg -a work # 发一张图片（见下文）
 python3 mab.py wechat-unread -a work                       # 读所有未读聊天的新消息（见下文）
+python3 mab.py wechat-pending -a work                      # 还没处理的消息（见下文「待处理缓存」）
+python3 mab.py wechat-peek -a work                         # 有没有要处理的，不碰微信，给自动回复的 hook 用（见下文）
+python3 mab.py wechat-unread --images -a work              # 同时把图片下载下来（见下文）
 python3 mab.py wechat-friends --accept -a work             # 通过所有好友申请（见下文）
+python3 mab.py wechat-whois "联系人" -a work               # 查私聊联系人的昵称和微信号
 ```
 
 ## 让 Muse 收发微信（可选）
@@ -199,7 +204,7 @@ python3 mab.py wechat-send "张三" "明天下午三点开会" -a work
 1. 从左侧「微信」标签读出未读总数；0 条就直接返回。
 2. 扫描会话列表，找出要读的聊天。
 3. 逐个点开，读新消息。**群聊**里每条消息会点一下头像，从弹出的资料卡里读出发送人的昵称和微信号（`from` 是 `me` / `other` / `system`）；**私聊**不点头像，发送人就是这个聊天本身（`group: false`）。
-4. 切回你原来打开的聊天，把读过的聊天**标回未读**（右键 →「标为未读」）。标回后显示「1条未读」，不是原来的条数。
+4. 切到「文件传输助手」（不切回你原来打开的聊天，免得那个聊天一直开着、新消息直接变成已读），再把读过的聊天**标回未读**（右键 →「标为未读」）。标回后显示「1条未读」，不是原来的条数。
 
 **不会重复读：** 每个聊天会记下读到的最后 3 条消息（存在本机 `~/.cache/wx-send/cursor/`，不会上传）。下次只返回这之后的新消息；会话列表的预览和上次一样的，直接跳过，不点进去。3 天没更新的记录每天自动清理一次。
 
@@ -220,9 +225,22 @@ python3 mab.py wechat-send "张三" "明天下午三点开会" -a work
             "messages": [{"type": "message", "text": "方案发群里了", "from": "other", "sender": "李四", "wxid": "lisi_88"}]}]}
 ```
 
+**待处理缓存（不丢消息）：** 通过 bridge 读到的新消息，会先放进 Mac 本地的待处理缓存（`~/.cache/wx-send/pending/`），一直留到处理完为止：
+- 返回里的 `pending` 列出**所有还没处理的消息**（包括以前读到、还没回复的），这次新读到的标 `"new": true`，每条都有 `id`。
+- 用 `wechat-send` 回复某个聊天成功后，会自动清掉这个聊天在回复前的待处理消息（返回里的 `acked` 是清掉的条数）。群里回复一次，就算把这个群处理完了。
+- 不需要回复的聊天，用 `wechat-ack` 手动清掉。
+- `wechat-pending` 随时查看还有什么没处理，不碰微信，马上返回。
+
+```bash
+python3 mab.py wechat-pending -a work              # 查看待处理
+python3 mab.py wechat-ack "项目群" -a work          # 清掉这个聊天的待处理（--upto ID 只清到这一条）
+```
+
+**读了谁就要未读谁：** 点开一个聊天之前会先记账（`~/.cache/wx-send/remark-账号.json`），标回未读之后才销账。读到一半被打断（比如你动了鼠标、微信被切走），没来得及标回未读的聊天，下一次调用 `wechat-unread` 时会先补标，并且按原来的未读条数重新读。读取进度也是成功输出结果之后才保存。
+
 **管理读取记录：**
 ```bash
-python3 mab.py wechat-forget "张三" -a work     # 删掉某个聊天的读取记录，下次按「N条未读」重新读
+python3 mab.py wechat-forget "张三" -a work     # 删掉某个聊天的读取记录，下次按「N条未读」重新读（只影响 wechat-unread；wechat-read 没有读取记录）
 python3 mab.py wechat-prune --days 3 -a work    # 删掉 3 天没更新的读取记录
 ```
 
@@ -230,6 +248,31 @@ python3 mab.py wechat-prune --days 3 -a work    # 删掉 3 天没更新的读取
 - 执行期间微信会被切到前台，逐个点开聊天，群聊还要逐条点头像。未读多的时候可能要几分钟，期间不要动 Mac。
 - 每次最多读 20 个聊天、每个聊天最多 50 条消息（`--max-chats` / `--max-messages` 可调）。
 - 电脑上点开聊天后，手机上的未读也会被清掉；电脑上标回未读后，手机上会不会跟着变回未读还没有验证。
+
+### 自动回复：用 peek 判断要不要唤醒
+
+让 Muse 那边的 hook 每 1~2 分钟调一次 `wechat-peek`，返回 `"wake": true` 时才唤醒 agent 走完整流程（`wechat-unread` → 回复或 `wechat-ack`）。peek 不切微信到前台、不点开聊天、不排队等别的微信操作，几十毫秒就返回：
+
+```bash
+python3 mab.py wechat-peek -a work
+# {"ok": true, "wake": true, "reasons": ["new"],
+#  "new": [{"chat": "张三", "id": "wxid_abc123", "preview": "在吗", "time": "2026-09-29T14:53:39"}],
+#  "badge": 3, "badge_base": 1, "pending": 0, "stale": []}
+```
+
+三个信号，满足任意一个就唤醒：
+- **新通知**（`new`）：读 macOS 的通知记录，列出上次 `wechat-unread` 之后送达的微信通知。`wechat-unread` 成功之前会一直唤醒。
+- **Dock 角标**（`badge`）：角标比上次 `wechat-unread` 之后的值高就唤醒（在手机上读掉了几条，基线会跟着降）。
+- **超时没处理**（`stale`）：待处理消息超过 30 分钟（`WX_PEEK_STALE_MIN`）还没回复或 `ack`，每 30 分钟提醒一次。
+- **没读全**（`incomplete`）：上次 `wechat-unread` 有聊天读失败，或未读聊天太多只读了一部分，同样每 30 分钟提醒一次，直到读全。
+
+注意：
+- 要在微信设置里打开「通知显示消息详情」，否则 `new` 里只有 `id`，没有聊天名和预览。
+- `new[].chat` 只供参考（可能是对方昵称而不是你的备注名），回复和 `ack` 用 `pending` 里的聊天名。
+- `id` 是微信内部 ID，不等于资料卡上的微信号（对方改过微信号时两者不同）；要微信号仍然用 `wechat-whois`。
+- 免打扰的群不发通知，只能靠定时跑一轮完整的 `wechat-unread` 兜底。
+- `send`、`read`、`whois` 做完后微信会切回「文件传输助手」，免得停在客户的聊天上，他紧接着回的消息直接变成已读。
+- 读到对方撤回消息的提示时，`~/Library/Logs/mab-bridge.log` 里会记一行 `撤回`。
 
 ### 通过好友申请
 
@@ -258,10 +301,68 @@ WX_FRIEND_GREETING='你好，很高兴认识你'
 - 通过的新朋友如果和已有好友同名，以后按名字 `wechat-send` 会返回 `duplicate_name`，给其中一个设个备注就好。
 - 通过的记录会写进发送日志（`FRIEND_ACCEPTED`）。
 
+### 发图片
+
+一次发一张。图片先放进仓库里的 `outbox/` 文件夹（不会提交到 Git），再按文件名发送。**只有 `outbox/` 里的图片能发**，Muse 碰不到 Mac 上的其他文件。
+
+**图片从哪来：**
+
+1. **Muse 那边的图片**（比如你刚在手机上拍了发给 Muse）：
+   ```bash
+   python3 mab.py wechat-send "张三" --image /tmp/photo.jpg -a work
+   ```
+   Muse 的 VM 里有这个文件的话，会自动先上传到 Mac 的 `outbox/`，再发送。上传后会打印存下来的文件名（重名时会自动改名，比如 `photo-1.jpg`）；发送失败要重试时，用**这个文件名**（`--image photo-1.jpg`），不用再传一遍。
+2. **Mac 剪贴板里的图片**：先在 Mac 上复制一张图片（截图、网页上右键「拷贝图像」），然后：
+   ```bash
+   python3 mab.py wechat-clip             # 返回存下来的文件名，比如 clip-20260928-153000.png
+   python3 mab.py wechat-send "张三" --image clip-20260928-153000.png -a work
+   ```
+   在 Finder 里复制的是文件，不是图片本身，会返回错误；要发这个文件，把它拖进 `outbox/` 再按文件名发送。
+3. **你自己放进 `outbox/` 的图片**：直接按文件名发送。文件名只能含字母、数字、中文、空格和 `._-`，不能以点开头，否则 `wechat-images` 里看不到。
+
+**看一眼再发：**
+```bash
+python3 mab.py wechat-images                   # 列出 outbox 里的图片（最新的在前）
+python3 mab.py wechat-thumb clip-xxx.png       # 下载缩略图（长边 512）给你确认
+```
+
+**发送时会核对什么：** 和发文字一样，先核对聊天标题、确认输入框是空的；粘贴后确认输入框里是一张图片；发出后确认聊天记录里多了一条图片消息。读不到输入框时直接停止，不会不核对就发。图片消息目前**不检测**发送失败的红色感叹号，返回的 `output` 里会写「未检测发送失败标记」。
+
+**注意：**
+- 支持 JPG、PNG、GIF、HEIC（HEIC 会自动转成 JPG），单张最大约 50 MB（`WX_IMAGE_MAX_MB`，防止请求过大把 bridge 撑坏，不是微信的限制）。
+- GIF 动图可能只发出第一帧（粘贴时会转成静态图，还没有验证过）。
+- 文件名里的空格和特殊字符会换成 `_`，重名时自动加 `-1`、`-2`，以返回的 `file` 为准。
+- 发完不会自动删除，`outbox/` 需要自己清理。
+- 发图片和发文字一样，计入发送间隔和每天的发送上限。
+
+### 读图片
+
+`wechat-read` 和 `wechat-unread` 加上 `--images`，读到图片消息时会把原图取出来：在 Mac 上右键图片 →「复制」→ 存进仓库的 `inbox/`（不会提交到 Git），然后 mab 自动下载到 Muse 那边的 `./wechat-images/`，并在这条消息上加 `local_path`。
+
+```bash
+python3 mab.py wechat-read "张三" -n 10 --images -a work
+python3 mab.py wechat-unread --images -a work
+```
+
+返回示例：
+```json
+{"type": "message", "text": "图片", "image": "in-20260928-141500-1.png",
+ "local_path": "/home/muse/wechat-images/in-20260928-141500-1.png"}
+```
+
+**注意：**
+- 默认不取图。每张要右键复制一次，大约 1 秒；每次最多 10 张（`--max-images`，最多 50），超出的会写在 `notes` 里。
+- 取到的是原图尺寸（微信会重新编码，文件和对方发的不完全相同）。别人刚发来、你还没点开的图也能取到原图。
+- 取不到的图片，这条消息会有 `image_error` 说明原因，其他消息照常返回。
+- 读的过程中剪贴板会被用到，读完会恢复原样。
+- `inbox/` 里的图片保留 3 天（`WX_INBOX_DAYS`），下次带 `--images` 读的时候自动清理。
+- **隐私**：带 `--images` 时，别人发给你的图片会传到 Muse 的云端 VM。群聊里的图片尤其注意，需要时再开。
+
 ### 限制
 
-- `wechat-read` 只能读到聊天窗口里当前加载出来的消息（通常是最近十几条），也分不出每条是谁发的。
+- `wechat-read` 从最新往上一页页翻着读，`-n` 条数不设上限（含时间行），翻到顶就停；分不出每条是谁发的。
 - 同一时间只处理一个请求，其余的排队等待（最多 180 秒）。
+- 每个请求都记在 Mac 的 `~/Library/Logs/mab-bridge.log`：接口、账号、聊天名、耗时、状态码，失败时带原因；回复时连接已经断开也会记下来。消息内容不记。
 - 内置防风控：同一账号两次发送至少间隔 3 秒（间隔不够会自动等待），每天最多 500 条（`WX_DAILY_MAX` 可调）。
 - 偶尔会出现点击搜索结果后聊天没有切换过去的情况，这时会返回 `verify_failed`，不会粘贴也不会发送，重试即可。
 
@@ -279,12 +380,21 @@ WX_FRIEND_GREETING='你好，很高兴认识你'
 | POST | `/scroll` | `{"amount","x?","y?"}` | 滚动，正数向上 |
 | POST | `/type` | `{"text"}` | 输入文字（支持中文） |
 | POST | `/key` | `{"keys":[...]}` | 按键或组合键 |
-| POST | `/wechat/send` | `{"to","text","account?","dry_run?"}` | 发微信（见上文） |
-| POST | `/wechat/read` | `{"chat","limit?","account?"}` | 读聊天记录，默认 20 条 |
-| POST | `/wechat/unread` | `{"account?","list_only?","max_chats?","max_messages?"}` | 读所有未读聊天的新消息 |
+| POST | `/wechat/send` | `{"to","text" 或 "image","account?","dry_run?"}` | 发微信文字或 outbox 里的一张图片（见上文） |
+| POST | `/wechat/read` | `{"chat","limit?","account?","images?","max_images?"}` | 读聊天记录，默认 20 条 |
+| POST | `/wechat/unread` | `{"account?","list_only?","max_chats?","max_messages?","images?","max_images?"}` | 读所有未读聊天的新消息，返回里的 `pending` 是所有待处理消息 |
+| POST | `/wechat/pending` | `{"account?"}` | 待处理消息，不碰微信 |
+| POST | `/wechat/ack` | `{"chat","account?","upto_id?"}` | 清掉这个聊天的待处理消息 |
+| GET | `/wechat/peek?account=` | — | 有没有要处理的（新通知、角标、超时的待处理），不碰微信、不排队 |
+| POST | `/wechat/whois` | `{"chat","account?"}` | 私聊联系人的昵称和微信号：点对方头像读资料卡，返回 `name`、`wxid` |
 | POST | `/wechat/forget` | `{"chat","account?"}` | 删掉某个聊天的读取记录 |
 | POST | `/wechat/prune` | `{"days?","account?"}` | 删掉 N 天没更新的读取记录 |
 | POST | `/wechat/friends` | `{"account?","accept?"}` | 列出 / 通过好友申请 |
+| POST | `/wechat/image/upload` | `{"name?","data"}` | 图片（base64）存进 outbox |
+| POST | `/wechat/image/clipboard` | `{"name?"}` | Mac 剪贴板里的图片存进 outbox |
+| GET | `/wechat/images` | — | 列出 outbox 里的图片 |
+| GET | `/wechat/image/thumb?file=` | — | 缩略图（JPEG，长边 512） |
+| GET | `/wechat/inbox/file?file=` | — | 读消息时取到的原图 |
 
 注意：操作前至少要调用一次 `/screenshot`，服务才知道该用哪个坐标系。
 
@@ -304,6 +414,11 @@ WX_FRIEND_GREETING='你好，很高兴认识你'
 | `WX_MUTED_ALLOW` | 空 | 读未读时要读的免打扰群，用 `\|` 分隔 |
 | `WX_CURSOR_DAYS` | `3` | 读取记录保留几天 |
 | `WX_FRIEND_GREETING` | 空 | 通过好友申请后自动发的第一句话 |
+| `WX_IMAGE_MAX_MB` | `50` | 单张图片上限（按上传请求的大小粗略检查） |
+| `WX_MAX_IMAGES` | `10` | 读消息带图时，每次最多取几张 |
+| `WX_IMAGE_WAIT` | `3` | 点「复制」后，最多等几秒让剪贴板出现图片 |
+| `WX_INBOX_DAYS` | `3` | `inbox/` 里的图片保留几天 |
+| `WX_PEEK_STALE_MIN` | `30` | 待处理消息超过几分钟没处理，peek 就提醒一次 |
 
 ## 安全须知
 
@@ -348,7 +463,8 @@ The official Muse for Mac app ships as arm64-only, so on Intel Macs it fails wit
 - The agent always works in screenshot pixel coordinates; the server maps them to macOS points (Retina-aware).
 - Binds to `127.0.0.1` by default; every request needs a bearer token.
 - Works on Intel and Apple silicon, macOS 12+.
-- Optional WeChat endpoints (`/wechat/send`, `/wechat/read`, `/wechat/unread`, `/wechat/friends`) call `wx-send.sh` on the Mac to send/read messages by exact contact name, with no screenshots involved.
+- Optional WeChat endpoints (`/wechat/send`, `/wechat/read`, `/wechat/unread`, `/wechat/friends`, `/wechat/image/*`) call `wx-send.sh` on the Mac to send text or a single image / read messages by exact contact name, with no screenshots involved. Images must live in the repo's `outbox/` folder (uploaded from the agent's VM, saved from the Mac clipboard, or dropped in by you).
+- `GET /wechat/peek` tells an agent's hook whether to wake up (new macOS notifications from WeChat, a Dock badge above its baseline, or pending messages left unhandled for 30 minutes) without touching WeChat.
 
 Quick start: `./start.sh` → grant Screen Recording + Accessibility to your terminal → `./start.sh --funnel` → paste [docs/muse-prompt.md](docs/muse-prompt.md) into Muse.
 
