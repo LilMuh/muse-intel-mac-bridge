@@ -46,6 +46,13 @@ python3 mab.py info
 - 返回 `status` 是 `unconfirmed_do_not_retry` 时不要重发，先用 `wechat-read` 查看是否已经发出。
 - 其他非 `ok` 的状态，把 `output` 告诉我，不要自己换个名字重试。
 
+**自动回复：**
+
+1. hook 每 1~2 分钟运行 `python3 mab.py wechat-peek -a <账号别名>`，只有 `wake` 为 `true` 时才唤醒 agent；上一轮还没跑完时不要再唤醒。
+2. 被唤醒后：`wechat-unread` → 以 `pending` 为准逐个处理 → 回复或 `ack`。
+3. `peek` 的 `new[].chat` 只供参考，回复和 `ack` 用 `pending` 里的聊天名；发兑换码前仍然用 `wechat-whois` 查微信号。
+4. 保留每 60 分钟一轮的完整流程作为兜底（免打扰白名单里的群只能靠它）。
+
 ---
 
 ## 如果 Muse 无法下载 mab.py
