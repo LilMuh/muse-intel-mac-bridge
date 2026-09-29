@@ -23,6 +23,7 @@ muse-intel-mac-bridge · Mac 端服务
   POST /wechat/friends {"account":"work","accept":false}      列出（accept=true 时通过）好友申请
   POST /wechat/pending {"account":"work"}                     待处理消息（unread 读到、还没回复或 ack 的），不碰微信
   POST /wechat/ack    {"chat":"联系人","account":"work","upto_id":12}  清掉这个聊天的待处理消息（回复成功时会自动清）
+  GET  /wechat/peek?account=work                              有没有要处理的（新通知、角标、超时的待处理），不碰微信、不排队
   POST /wechat/send   {"to":"联系人","image":"a.jpg"}          发 outbox 里的一张图片（text 和 image 二选一）
   POST /wechat/image/upload    {"name":"a.jpg","data":"<base64>"}  图片存进 outbox
   POST /wechat/image/clipboard {"name":"x.png"}                  Mac 剪贴板里的图片存进 outbox
@@ -45,6 +46,7 @@ Retina 缩放与截图缩放比例 agent 都无需关心。
   WX_FRIEND_GREETING  通过好友申请后自动发的第一句话（不填就不发）
   WX_IMAGE_MAX_MB  单张图片上限，默认 50（只在请求阶段按请求大小检查）
   BRIDGE_LOG    请求日志，默认 ~/Library/Logs/mab-bridge.log（满 5 MB 轮换，留 3 份）
+  WX_PEEK_STALE_MIN  待处理消息超过几分钟没处理就让 peek 提醒一次（默认 30）
   WX_MAX_IMAGES / WX_IMAGE_WAIT / WX_INBOX_DAYS  读图：每次最多几张（10）、复制后等几秒（3）、inbox 保留几天（3）
 """
 import base64
@@ -82,6 +84,7 @@ WX_SEND = os.path.expanduser(os.environ.get(
 OUTBOX = os.path.join(os.path.dirname(os.path.abspath(__file__)), "outbox")
 INBOX = os.path.join(os.path.dirname(os.path.abspath(__file__)), "inbox")
 PENDING_DIR = os.path.expanduser("~/.cache/wx-send/pending")   # 待处理消息缓存：unread 读到的，回复或 ack 后才清
+PEEK_DIR = os.path.expanduser("~/.cache/wx-send/peek")   # peek 的状态：新通知从哪算起、角标基线、上次超时提醒
 CD_EPOCH = 978307200   # 通知数据库的时间从 2001-01-01 UTC 起算
 
 
@@ -101,6 +104,7 @@ pyautogui.FAILSAFE = True  # 把鼠标甩到屏幕左上角可紧急中断 agent
 pyautogui.PAUSE = 0.05
 
 lock = threading.Lock()
+peek_lock = threading.Lock()   # peek 不拿全局锁，只用它保护 peek 状态文件的「读→改→写」
 state = {"img_w": None, "img_h": None}
 
 
@@ -352,6 +356,7 @@ def a_wechat_unread(p):
     args = ["--unread"] + (["--list-only"] if p.get("list_only") else [])
     if p.get("images"):
         prune_inbox(inbox_days())
+    started = time.time()   # 用开始时间：跑的过程中进来的通知下次还算新的
     # 要逐个点开聊天、点头像识别发送人，未读多时会很久
     code, out, err = run_wx(args, p.get("account"), env, timeout=1800)
     result = wx_json(code, out, err)
@@ -362,6 +367,7 @@ def a_wechat_unread(p):
             save_pending(p.get("account"), data)
         except OSError as e:
             raise ValueError(f"待处理缓存写不进去（{e}），原始输出：{out}")
+        mark_unread_done(p.get("account"), started)
     result["pending"] = pending_view(data, new)
     return result
 
@@ -577,13 +583,16 @@ def load_pending(account) -> dict:
         return {"next_id": 1, "chats": {}}
 
 
-def save_pending(account, data):
-    """先写临时文件再改名，写到一半退出也不会把旧缓存写坏。"""
-    os.makedirs(PENDING_DIR, exist_ok=True)
-    path = pending_path(account)
+def write_json(path, data):
+    """先写临时文件再改名，写到一半退出也不会把旧文件写坏。"""
+    os.makedirs(os.path.dirname(path), exist_ok=True)
     with open(path + ".tmp", "w", encoding="utf-8") as f:
         json.dump(data, f, ensure_ascii=False)
     os.replace(path + ".tmp", path)
+
+
+def save_pending(account, data):
+    write_json(pending_path(account), data)
 
 
 def add_pending(data, chats) -> set:
@@ -631,6 +640,84 @@ def clear_pending(data, chat, upto=None) -> int:
     return n
 
 
+def peek_path(account) -> str:
+    return os.path.join(PEEK_DIR, os.path.basename(pending_path(account)))
+
+
+def load_peek(account) -> Optional[dict]:
+    try:
+        with open(peek_path(account), encoding="utf-8") as f:
+            return json.load(f)
+    except FileNotFoundError:
+        return None
+
+
+def save_peek(account, st):
+    write_json(peek_path(account), st)
+
+
+def stale_minutes() -> int:
+    v = os.environ.get("WX_PEEK_STALE_MIN", "30")
+    if not v.isdigit() or int(v) < 1:
+        raise ValueError(f"WX_PEEK_STALE_MIN 必须是正整数：{v!r}")
+    return int(v)
+
+
+def stale_chats(data, cutoff) -> list:
+    """待处理缓存里 added 早于 cutoff 的消息，按聊天汇总。"""
+    out = []
+    for name, c in data["chats"].items():
+        old = [m["added"] for m in c["messages"] if m["added"] < cutoff]
+        if old:
+            out.append({"chat": name, "count": len(old), "oldest": min(old)})
+    return out
+
+
+def a_wechat_peek(account):
+    """不碰微信，看有没有要处理的：新通知、角标超过基线、待处理消息超时没人管。"""
+    bundle, now, minutes = wechat_bundle(account), time.time(), stale_minutes()
+    badge = read_badge(bundle)
+    result, reasons = {"ok": True, "new": [], "badge": badge}, []
+    with peek_lock:
+        st = load_peek(account) or {"since": now, "badge_base": badge or 0, "reminded": 0}   # 第一次：历史不算新
+        try:
+            result["new"] = read_notifications(bundle, st["since"])[-50:]
+        except OSError as e:
+            result["notify_error"] = str(e)
+        if result["new"]:
+            reasons.append("new")
+        if badge is not None and badge < st["badge_base"]:
+            st["badge_base"] = badge          # 在手机上读掉了几条
+        elif badge is not None and badge > st["badge_base"]:
+            reasons.append("badge")
+        data = load_pending(account)
+        result["stale"] = stale_chats(data, time.strftime("%Y-%m-%dT%H:%M:%S", time.localtime(now - minutes * 60)))
+        if result["stale"] and now - st["reminded"] >= minutes * 60:
+            reasons.append("stale")
+            st["reminded"] = now
+        save_peek(account, st)
+    result.update(badge_base=st["badge_base"], pending=sum(len(c["messages"]) for c in data["chats"].values()),
+                  reasons=reasons, wake=bool(reasons))
+    return result
+
+
+def mark_unread_done(account, started):
+    """unread 成功后：新通知从这次开始的时间算起，角标基线取现在的值；出错只记日志，不影响 unread 的结果。"""
+    try:
+        badge = read_badge(wechat_bundle(account))
+    except ValueError:
+        badge = None
+    try:
+        with peek_lock:
+            st = load_peek(account) or {"badge_base": 0, "reminded": 0}
+            st["since"] = started
+            if badge is not None:
+                st["badge_base"] = badge
+            save_peek(account, st)
+    except (OSError, ValueError) as e:
+        log.info("peek 状态没写进去：%s", e)
+
+
 def prune_inbox(days):
     """删掉 inbox 里超过 days 天、而且待处理缓存里没有引用的图片。"""
     keep = set()
@@ -676,6 +763,7 @@ def setup_log():
 class Handler(BaseHTTPRequestHandler):
     server_version = f"muse-intel-mac-bridge/{__version__}"
     started, what = 0.0, ""   # 请求开始时间、日志里记的参数（不含消息内容和图片）
+    quiet = False             # peek 每分钟一次，只在要唤醒或出错时记日志
 
     def _authed(self):
         got = self.headers.get("Authorization", "")
@@ -699,11 +787,14 @@ class Handler(BaseHTTPRequestHandler):
         except OSError as e:   # 客户端（或隧道）在我们回复前已经断开，连接已经没用了
             note = f"回复时连接已断开：{e!r}；{note}"
             self.close_connection = True
+        if self.quiet and code == 200:
+            return
         log.info("%s\t%s\t%s\t%.1fs\t%d 字节\t%s\t%s", self.command, urlparse(self.path).path, code,
                  time.time() - self.started, len(body), self.what, note.replace("\n", " ⏎ "))
 
     def do_GET(self):
         self.started = time.time()
+        self.quiet = False   # 现在是 HTTP/1.0，一个连接一个请求；以后改成长连接时不会串
         if not self._authed():
             return self._send(401, {"error": "unauthorized"})
         path = urlparse(self.path).path
@@ -713,6 +804,12 @@ class Handler(BaseHTTPRequestHandler):
                     data, w, h = take_screenshot()
                 return self._send(200, data, "image/jpeg",
                                   {"X-Image-Width": w, "X-Image-Height": h})
+            if path == "/wechat/peek":
+                account = parse_qs(urlparse(self.path).query).get("account", [None])[0]
+                self.what = json.dumps({"account": account}, ensure_ascii=False) if account else ""
+                result = a_wechat_peek(account)
+                self.quiet = not result["wake"] and "notify_error" not in result
+                return self._send(200, result)
             if path == "/wechat/images":
                 return self._send(200, list_images())
             if path == "/wechat/inbox/file":
@@ -737,6 +834,7 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_POST(self):
         self.started = time.time()
+        self.quiet = False   # 现在是 HTTP/1.0，一个连接一个请求；以后改成长连接时不会串
         if not self._authed():
             return self._send(401, {"error": "unauthorized"})
         action = ACTIONS.get(urlparse(self.path).path.strip("/"))
