@@ -35,9 +35,11 @@ muse-intel-mac-bridge · 客户端（在 agent 的 Linux VM 里运行，只依�
 """
 import argparse
 import base64
+import http.client
 import json
 import os
 import sys
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -45,6 +47,7 @@ import urllib.request
 URL = os.environ.get("MAB_URL", "").rstrip("/")
 TOKEN = os.environ.get("MAB_TOKEN", "")
 TIMEOUT = float(os.environ.get("MAB_TIMEOUT", "30"))
+SAFE_POSTS = ("/wechat/pending",)   # 重复调用也没关系的 POST：断连后可以重试
 
 
 def request(method, path, payload=None, timeout=TIMEOUT, fatal=True):
@@ -55,13 +58,25 @@ def request(method, path, payload=None, timeout=TIMEOUT, fatal=True):
     req.add_header("Authorization", f"Bearer {TOKEN}")
     if data is not None:
         req.add_header("Content-Type", "application/json")
-    try:
-        with urllib.request.urlopen(req, timeout=timeout) as r:
-            return r.read(), dict(r.headers)
-    except urllib.error.HTTPError as e:
-        msg = f"HTTP {e.code}: {e.read().decode(errors='replace')}"
-    except urllib.error.URLError as e:
-        msg = f"连接失败 / connection failed: {e.reason}"
+    retry = method == "GET" or path in SAFE_POSTS   # 只读或重复也无害的请求，连接出错时重试一次
+    for attempt in range(2 if retry else 1):
+        if attempt:
+            time.sleep(1)
+        try:
+            with urllib.request.urlopen(req, timeout=timeout) as r:
+                return r.read(), dict(r.headers)
+        except urllib.error.HTTPError as e:   # bridge 回复了：不重试
+            msg = f"HTTP {e.code}: {e.read().decode(errors='replace')}"
+            break
+        except urllib.error.URLError as e:
+            msg = f"连接失败 / connection failed: {e.reason}"
+        except (http.client.HTTPException, OSError) as e:   # 连上以后中途断开或超时：bridge 可能已经执行了
+            msg = f"连接中途断开 / connection dropped: {e!r}"
+            if not retry:
+                msg += "。bridge 可能已经执行了这个操作，结果未知：先确认再决定要不要重做"
+    else:
+        if retry:
+            msg += "（已重试一次仍失败）"
     if fatal:
         sys.exit(msg)
     raise RuntimeError(msg)

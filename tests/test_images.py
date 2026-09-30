@@ -3,6 +3,7 @@ import http.client
 import json
 import os
 import plistlib
+import re
 import shutil
 import socket
 import sqlite3
@@ -934,6 +935,70 @@ class MabTest(ServerCase):
         m = json.loads(r.stdout)["pending"]["张三"]["messages"][0]
         self.assertTrue(os.path.isfile(m["local_path"]))
         self.assertEqual(os.listdir(os.path.join(self.tmp, "got")), ["in-1.png"])
+
+
+class MabDisconnectTest(unittest.TestCase):
+    def serve(self, drops):
+        """起一个假 bridge：前 drops 个连接读完请求就直接断开，之后的正常回 {"ok": true}。"""
+        srv = socket.socket()
+        srv.bind(("127.0.0.1", 0))
+        srv.listen(5)
+        self.addCleanup(srv.close)
+        self.conns = 0
+
+        def loop():
+            while True:
+                try:
+                    c, _ = srv.accept()
+                except OSError:
+                    return
+                self.conns += 1
+                buf = b""
+                while b"\r\n\r\n" not in buf:
+                    chunk = c.recv(65536)
+                    if not chunk:
+                        break
+                    buf += chunk
+                head, _, body = buf.partition(b"\r\n\r\n")
+                m = re.search(rb"content-length: (\d+)", head, re.I)
+                while m and len(body) < int(m.group(1)):
+                    chunk = c.recv(65536)
+                    if not chunk:
+                        break
+                    body += chunk
+                if self.conns > drops:
+                    out = b'{"ok": true}'
+                    c.sendall(b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: %d\r\n"
+                              b"Connection: close\r\n\r\n%s" % (len(out), out))
+                c.close()
+        threading.Thread(target=loop, daemon=True).start()
+        return srv.getsockname()[1]
+
+    def mab(self, port, *args):
+        env = dict(os.environ, MAB_URL=f"http://127.0.0.1:{port}", MAB_TOKEN=TOKEN)
+        return subprocess.run([sys.executable, os.path.join(ROOT, "mab.py"), *args],
+                              capture_output=True, text=True, env=env, timeout=60)
+
+    def test_peek_retries_once_after_disconnect(self):
+        port = self.serve(drops=1)
+        r = self.mab(port, "wechat-peek", "-a", "work")
+        self.assertEqual((r.returncode, r.stdout.strip(), self.conns), (0, '{"ok": true}', 2), r.stderr)
+
+    def test_pending_gives_up_after_second_disconnect(self):
+        port = self.serve(drops=9)
+        r = self.mab(port, "wechat-pending", "-a", "work")
+        self.assertNotEqual(r.returncode, 0)
+        self.assertNotIn("Traceback", r.stderr)
+        self.assertIn("已重试", r.stderr)
+        self.assertEqual(self.conns, 2)
+
+    def test_send_does_not_retry_after_disconnect(self):
+        port = self.serve(drops=9)
+        r = self.mab(port, "wechat-send", "张三", "在吗", "-a", "work")
+        self.assertNotEqual(r.returncode, 0)
+        self.assertNotIn("Traceback", r.stderr)
+        self.assertIn("结果未知", r.stderr)
+        self.assertEqual(self.conns, 1)
 
 
 class LogTest(ServerCase):

@@ -44,6 +44,7 @@ python3 mab.py info
 - 联系人名字必须和微信里显示的完全一致。
 - 发送前先把联系人和内容复述给我，等我回复「确认」再发。
 - 返回 `status` 是 `unconfirmed_do_not_retry` 时不要重发，先用 `wechat-read` 查看是否已经发出。
+- 报错「连接中途断开……结果未知」时（网络在 bridge 回复前断了），不要直接重试：发消息先用 `wechat-read` 看是否已经发出，`ack`、通过好友申请先用只读的 `wechat-pending`、`wechat-friends` 确认。peek、`wechat-pending` 这类读操作会自动重试一次。
 - 其他非 `ok` 的状态，把 `output` 告诉我，不要自己换个名字重试。
 
 **自动回复：**
