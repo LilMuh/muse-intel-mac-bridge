@@ -44,14 +44,18 @@ python3 mab.py info
 - 联系人名字必须和微信里显示的完全一致。
 - 发送前先把联系人和内容复述给我，等我回复「确认」再发。
 - 返回 `status` 是 `unconfirmed_do_not_retry` 时不要重发，先用 `wechat-read` 查看是否已经发出。
+- 报错「连接中途断开……结果未知」时（网络在 bridge 回复前断了），不要直接重试：发消息先用 `wechat-read` 看是否已经发出，`ack`、通过好友申请先用只读的 `wechat-pending`、`wechat-friends` 确认。peek、`wechat-pending` 这类读操作会自动重试一次。
 - 其他非 `ok` 的状态，把 `output` 告诉我，不要自己换个名字重试。
 
 **自动回复：**
 
-1. hook 每 1~2 分钟运行 `python3 mab.py wechat-peek -a <账号别名>`，只有 `wake` 为 `true` 时才唤醒 agent；上一轮还没跑完时不要再唤醒。
-2. 被唤醒后：`wechat-unread` → 以 `pending` 为准逐个处理 → 回复或 `ack`。
-3. `peek` 的 `new[].chat` 只供参考，回复和 `ack` 用 `pending` 里的聊天名；发兑换码前仍然用 `wechat-whois` 查微信号。
-4. 保留每 60 分钟一轮的完整流程作为兜底（免打扰白名单里的群只能靠它）。
+1. hook 每 3 分钟运行 `python3 mab.py wechat-peek -a <账号别名>`，只有 `wake` 为 `true` 时才唤醒 agent；上一轮还没跑完时不要再唤醒。
+2. 被唤醒后用 `python3 mab.py wechat-pending -a <账号别名>` 拿全部待处理，按聊天处理：
+   - 聊天里有带 `needs_read` 的消息（图片、被截断的长文字、群里被 @）→ 用 `python3 mab.py wechat-read "<聊天名>" -n <够用的条数> --images -a <账号别名>` 打开读，看图片、完整文字和 @ 的内容；
+   - 只有纯文字 → 直接按待处理的内容回复，不用再读聊天；
+   - 群聊按群规则处理（不回的直接 `wechat-ack`）；
+   - 带 `name_unknown` 的聊天 → 不回，告诉我「通知没开消息详情」。
+3. 回复成功会自动清掉这个聊天的待处理；不回复的用 `wechat-ack`；需要我定夺的留着，peek 每 30 分钟提醒一次。不要在自动回复里跑 `wechat-unread`。
 
 ---
 
