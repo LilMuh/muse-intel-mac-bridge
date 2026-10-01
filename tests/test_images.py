@@ -283,7 +283,8 @@ class ServerCase(unittest.TestCase):
         self.wx_code = 0
         server.PENDING_DIR = os.path.join(self.tmp, "pending")
         server.PEEK_DIR = os.path.join(self.tmp, "peek")
-        self.db = os.path.join(self.tmp, "notify.db")
+        server.SENT_DIR = os.path.join(self.tmp, "sent")
+        self.db =os.path.join(self.tmp, "notify.db")
         make_notify_db(self.db)
         self.badge = 0
         for name, fake in (("NOTIFY_DBS", [self.db]), ("wechat_bundle", lambda account: "com.test.WeChat"),
@@ -391,6 +392,77 @@ class HttpTest(ServerCase):
             with self.subTest(name=name):
                 self.assertEqual(self.jcall("POST", "/wechat/send", {"to": "x", "image": name})[0], 400)
         self.assertEqual(self.calls, [])
+
+
+class DuplicateSendTest(ServerCase):
+    def send(self, **p):
+        return self.jcall("POST", "/wechat/send", dict({"to": "张三", "text": "试用码 1234", "account": "work"}, **p))[1]
+
+    def test_same_text_again_is_refused(self):
+        self.assertEqual(self.send()["status"], "ok")
+        body = self.send()
+        self.assertEqual((body["ok"], body["status"], body["last_status"]), (False, "duplicate_recent", "ok"))
+        self.assertEqual(len(self.calls), 1)
+
+    def test_force_sends_again(self):
+        self.send()
+        self.assertEqual(self.send(force=True)["status"], "ok")
+        self.assertEqual(len(self.calls), 2)
+
+    def test_other_text_chat_or_account_still_sends(self):
+        self.send()
+        for p in [{"text": "试用码 5678"}, {"to": "李四"}, {"account": "home"}]:
+            with self.subTest(p=p):
+                self.assertEqual(self.send(**p)["status"], "ok")
+        self.assertEqual(len(self.calls), 4)
+
+    def test_same_image_again_is_refused(self):
+        self.upload()
+        self.assertEqual(self.send(text=None, image="a.png")["status"], "ok")
+        self.assertEqual(self.send(text=None, image="a.png")["status"], "duplicate_recent")
+        self.assertEqual(self.send()["status"], "ok")   # 同一个人的文字不受影响
+
+    def test_unconfirmed_counts_as_sent(self):
+        self.wx_code = 10
+        self.send()
+        self.wx_code = 0
+        body = self.send()
+        self.assertEqual((body["status"], body["last_status"]), ("duplicate_recent", "unconfirmed_do_not_retry"))
+
+    def test_failed_send_can_retry(self):
+        for code in (4, 8):
+            with self.subTest(code=code):
+                self.wx_code = code
+                self.send()
+                self.wx_code = 0
+                self.assertEqual(self.send(text=f"重试 {code}")["status"], "ok")
+
+    def test_dry_run_is_not_recorded_or_blocked(self):
+        self.send(dry_run=True)
+        self.assertEqual(self.send()["status"], "ok")
+        self.assertEqual(self.send(dry_run=True)["status"], "ok")
+        self.assertEqual(len(self.calls), 3)
+
+    def test_window_expires(self):
+        self.send()
+        with mock.patch.object(server.time, "time", return_value=time.time() + 11 * 60):
+            self.assertEqual(self.send()["status"], "ok")
+
+    def test_window_env(self):
+        with mock.patch.dict(os.environ, {"WX_DUP_MIN": "0"}):
+            self.send()
+            self.assertEqual(self.send()["status"], "ok")
+        with mock.patch.dict(os.environ, {"WX_DUP_MIN": "x"}):
+            self.assertEqual(self.jcall("POST", "/wechat/send", {"to": "张三", "text": "hi"})[0], 400)
+
+    def test_record_has_no_plain_text(self):
+        self.send()
+        files = os.listdir(server.SENT_DIR)
+        self.assertEqual(files, ["work.json"])
+        with open(os.path.join(server.SENT_DIR, files[0]), encoding="utf-8") as f:
+            raw = f.read()
+        self.assertNotIn("试用码", raw)
+        self.assertNotIn("张三", raw)
 
 
 class InboxTest(ServerCase):
@@ -855,6 +927,19 @@ class MabTest(ServerCase):
         r = self.mab("wechat-send", "文件传输助手", "hi")
         self.assertEqual((r.returncode, self.calls), (0, [["文件传输助手", "hi"]]))
 
+    def test_send_force(self):
+        self.assertEqual(self.mab("wechat-send", "张三", "hi").returncode, 0)
+        r = self.mab("wechat-send", "张三", "hi")
+        self.assertEqual(json.loads(r.stdout)["status"], "duplicate_recent")
+        r = self.mab("wechat-send", "张三", "hi", "--force")
+        self.assertEqual((json.loads(r.stdout)["status"], len(self.calls)), ("ok", 2))
+
+    def test_request_id_is_logged(self):
+        with self.assertLogs("bridge") as cm:
+            self.mab("wechat-images")
+            time.sleep(0.2)
+        self.assertRegex(cm.records[0].getMessage(), r"\t[0-9a-f]{8}$")
+
     def test_upload_with_name(self):
         r = self.mab("wechat-upload", self.local_png(), "--name", "x")
         self.assertEqual(r.returncode, 0, r.stderr)
@@ -944,7 +1029,7 @@ class MabDisconnectTest(unittest.TestCase):
         srv.bind(("127.0.0.1", 0))
         srv.listen(5)
         self.addCleanup(srv.close)
-        self.conns = 0
+        self.conns, self.rids = 0, []
 
         def loop():
             while True:
@@ -960,6 +1045,8 @@ class MabDisconnectTest(unittest.TestCase):
                         break
                     buf += chunk
                 head, _, body = buf.partition(b"\r\n\r\n")
+                rid = re.search(rb"x-request-id: (\w+)", head, re.I)
+                self.rids.append(rid and rid.group(1).decode())
                 m = re.search(rb"content-length: (\d+)", head, re.I)
                 while m and len(body) < int(m.group(1)):
                     chunk = c.recv(65536)
@@ -983,6 +1070,7 @@ class MabDisconnectTest(unittest.TestCase):
         port = self.serve(drops=1)
         r = self.mab(port, "wechat-peek", "-a", "work")
         self.assertEqual((r.returncode, r.stdout.strip(), self.conns), (0, '{"ok": true}', 2), r.stderr)
+        self.assertEqual(self.rids[0], self.rids[1])   # 重试是同一个请求，编号不变
 
     def test_pending_gives_up_after_second_disconnect(self):
         port = self.serve(drops=9)
@@ -998,6 +1086,7 @@ class MabDisconnectTest(unittest.TestCase):
         self.assertNotEqual(r.returncode, 0)
         self.assertNotIn("Traceback", r.stderr)
         self.assertIn("结果未知", r.stderr)
+        self.assertIn(f"请求编号 {self.rids[0]}", r.stderr)
         self.assertEqual(self.conns, 1)
 
 

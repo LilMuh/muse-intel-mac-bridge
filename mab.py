@@ -16,8 +16,8 @@ muse-intel-mac-bridge · 客户端（在 agent 的 Linux VM 里运行，只依�
   python3 mab.py type "要输入的文字"
   python3 mab.py key command c              # 组合键，例如 command+c
   python3 mab.py wechat-read "联系人" [-n 20] [--images] [-a work]
-  python3 mab.py wechat-send "联系人" "消息" [--dry-run] [-a work]
-  python3 mab.py wechat-send "联系人" --image 图片 [--dry-run] [-a work]   # VM 里的路径会先上传；否则当作 outbox 里的文件名
+  python3 mab.py wechat-send "联系人" "消息" [--dry-run] [--force] [-a work]   # --force：10 分钟内发过同样的内容也照发
+  python3 mab.py wechat-send "联系人" --image 图片 [--dry-run] [--force] [-a work]   # VM 里的路径会先上传；否则当作 outbox 里的文件名
   python3 mab.py wechat-unread [--list-only] [--images] [-a work]   # --images：取图片，下载到 ./wechat-images，消息里加 local_path
   python3 mab.py wechat-pending [-a work]           # 待处理消息（unread 读到、还没回复或 ack 的），不碰微信
   python3 mab.py wechat-peek [-a work]              # 有没有要处理的（新通知、角标、超时的待处理），不碰微信，给 hook 用
@@ -43,6 +43,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+import uuid
 
 URL = os.environ.get("MAB_URL", "").rstrip("/")
 TOKEN = os.environ.get("MAB_TOKEN", "")
@@ -56,6 +57,8 @@ def request(method, path, payload=None, timeout=TIMEOUT, fatal=True):
     data = json.dumps(payload).encode() if payload is not None else None
     req = urllib.request.Request(URL + path, data=data, method=method)
     req.add_header("Authorization", f"Bearer {TOKEN}")
+    rid = uuid.uuid4().hex[:8]   # bridge 日志里会记下这个编号，断连时拿它去对
+    req.add_header("X-Request-Id", rid)
     if data is not None:
         req.add_header("Content-Type", "application/json")
     retry = method == "GET" or path in SAFE_POSTS   # 只读或重复也无害的请求，连接出错时重试一次
@@ -77,6 +80,7 @@ def request(method, path, payload=None, timeout=TIMEOUT, fatal=True):
     else:
         if retry:
             msg += "（已重试一次仍失败）"
+    msg += f"（请求编号 {rid}）"
     if fatal:
         sys.exit(msg)
     raise RuntimeError(msg)
@@ -154,6 +158,7 @@ def main():
     ws = sub.add_parser("wechat-send"); ws.add_argument("to"); ws.add_argument("text", nargs="?")
     ws.add_argument("--image", help="VM 里的图片路径（先上传），或 outbox 里的文件名")
     ws.add_argument("--dry-run", action="store_true"); ws.add_argument("-a", "--account")
+    ws.add_argument("--force", action="store_true", help="几分钟内给同一个人发过同样的内容也照发")
     wu = sub.add_parser("wechat-unread"); wu.add_argument("--list-only", action="store_true")
     wu.add_argument("--max-chats", type=int); wu.add_argument("--max-messages", type=int); wu.add_argument("-a", "--account")
     wpd = sub.add_parser("wechat-pending"); wpd.add_argument("-a", "--account")
@@ -204,7 +209,7 @@ def main():
     elif a.cmd == "wechat-send":
         if (a.text is None) == (a.image is None):
             sys.exit("文字和 --image 要给一个，且只能给一个")
-        p = {"to": a.to, "dry_run": a.dry_run, "account": a.account}
+        p = {"to": a.to, "dry_run": a.dry_run, "account": a.account, "force": a.force}
         if a.image is None:
             p["text"] = a.text
         elif os.path.isfile(a.image):

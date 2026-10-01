@@ -180,6 +180,7 @@ python3 mab.py wechat-send "张三" "明天下午三点开会" -a work
 | `duplicate_name` | 有多个同名联系人或群 | 在微信里给对方设置一个唯一的备注名 |
 | `draft_in_input` | 输入框里已有草稿。直接粘贴的话，草稿会和消息一起发出去，所以先停下 | 到 Mac 上清空输入框再重试 |
 | `unconfirmed_do_not_retry` | 可能已经发出，但没能确认 | **不要重发**，先用 `wechat-read` 看一下 |
+| `duplicate_recent` | 10 分钟内已经给这个人发过同样的内容，这次没发。`last_status` 是上次的结果 | 多半是断连后的重试，上次已经发出去了。确认对方没收到、真要再发，加 `--force` |
 | `verify_failed` | 某项核对没通过：聊天没切换过去、输入框不属于这个联系人、粘贴后内容对不上等。没有发送 | 消息可能还留在输入框里，清空后再重试 |
 | `send_failed` | 发送失败：消息旁边出现了红色感叹号，通常是网络问题 | 检查网络后重试 |
 | `daily_limit` | 这个账号今天已经发满 500 条 | 明天再发，或调高 `WX_DAILY_MAX` |
@@ -374,8 +375,9 @@ python3 mab.py wechat-unread --images -a work
 
 - `wechat-read` 从最新往上一页页翻着读，`-n` 条数不设上限（含时间行），翻到顶就停；分不出每条是谁发的。
 - 同一时间只处理一个请求，其余的排队等待（最多 180 秒）。
-- 每个请求都记在 Mac 的 `~/Library/Logs/mab-bridge.log`：接口、账号、聊天名、耗时、状态码，失败时带原因；回复时连接已经断开也会记下来。消息内容不记。
+- 每个请求都记在 Mac 的 `~/Library/Logs/mab-bridge.log`：接口、账号、聊天名、耗时、状态码，失败时带原因；回复时连接已经断开也会记下来。消息内容不记。行尾是 mab 带来的请求编号，mab 报连接错误时会打印同一个编号，拿它在日志里搜，就知道 bridge 有没有收到、执行结果是什么。
 - 内置防风控：同一账号两次发送至少间隔 3 秒（间隔不够会自动等待），每天最多 500 条（`WX_DAILY_MAX` 可调）。
+- 防重发：10 分钟内（`WX_DUP_MIN`，0 关闭）给同一个人发同样的文字或同一张图片，会返回 `duplicate_recent`，不会发第二遍；加 `--force` 照发。结果是 `ok` 或 `unconfirmed_do_not_retry` 的才算发过，试运行和失败的不算。记录在 `~/.cache/wx-send/sent/`，只存哈希，不存内容。
 - 偶尔会出现点击搜索结果后聊天没有切换过去的情况，这时会返回 `verify_failed`，不会粘贴也不会发送，重试即可。
 
 ## HTTP API
@@ -392,7 +394,7 @@ python3 mab.py wechat-unread --images -a work
 | POST | `/scroll` | `{"amount","x?","y?"}` | 滚动，正数向上 |
 | POST | `/type` | `{"text"}` | 输入文字（支持中文） |
 | POST | `/key` | `{"keys":[...]}` | 按键或组合键 |
-| POST | `/wechat/send` | `{"to","text" 或 "image","account?","dry_run?"}` | 发微信文字或 outbox 里的一张图片（见上文） |
+| POST | `/wechat/send` | `{"to","text" 或 "image","account?","dry_run?","force?"}` | 发微信文字或 outbox 里的一张图片（见上文） |
 | POST | `/wechat/read` | `{"chat","limit?","account?","images?","max_images?"}` | 读聊天记录，默认 20 条 |
 | POST | `/wechat/unread` | `{"account?","list_only?","max_chats?","max_messages?","images?","max_images?"}` | 读所有未读聊天的新消息，返回里的 `pending` 是所有待处理消息 |
 | POST | `/wechat/pending` | `{"account?"}` | 先从系统通知收新消息，再返回全部待处理，不碰微信 |
@@ -431,6 +433,7 @@ python3 mab.py wechat-unread --images -a work
 | `WX_IMAGE_WAIT` | `3` | 点「复制」后，最多等几秒让剪贴板出现图片 |
 | `WX_INBOX_DAYS` | `3` | `inbox/` 里的图片保留几天 |
 | `WX_PEEK_STALE_MIN` | `30` | 待处理消息超过几分钟没处理，peek 就提醒一次 |
+| `WX_DUP_MIN` | `10` | 几分钟内给同一个人发同样的内容会被拦下，0 关闭 |
 
 ## 安全须知
 
