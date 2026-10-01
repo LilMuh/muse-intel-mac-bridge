@@ -14,7 +14,7 @@ muse-intel-mac-bridge · Mac 端服务
   POST /scroll        {"amount":-5,"x":640,"y":400}   正数向上；x/y 可选
   POST /type          {"text":"hello 你好"}            非 ASCII 自动走剪贴板粘贴
   POST /key           {"keys":["command","c"]}
-  POST /wechat/send   {"to":"联系人","text":"消息","account":"work","dry_run":false}
+  POST /wechat/send   {"to":"联系人","text":"消息","account":"work","dry_run":false,"force":false}
   POST /wechat/read   {"chat":"联系人","limit":20,"account":"work","images":false}
   POST /wechat/unread {"account":"work","list_only":false,"images":false}   读所有未读聊天的新消息；images=true 时顺便取图
   POST /wechat/whois  {"chat":"联系人","account":"work"}      私聊联系人的昵称和微信号
@@ -47,9 +47,11 @@ Retina 缩放与截图缩放比例 agent 都无需关心。
   WX_IMAGE_MAX_MB  单张图片上限，默认 50（只在请求阶段按请求大小检查）
   BRIDGE_LOG    请求日志，默认 ~/Library/Logs/mab-bridge.log（满 5 MB 轮换，留 3 份）
   WX_PEEK_STALE_MIN  待处理消息超过几分钟没处理就让 peek 提醒一次（默认 30）
+  WX_DUP_MIN    几分钟内给同一个人发同样的内容会被拦下（默认 10，0 关闭；force 照发）
   WX_MAX_IMAGES / WX_IMAGE_WAIT / WX_INBOX_DAYS  读图：每次最多几张（10）、复制后等几秒（3）、inbox 保留几天（3）
 """
 import base64
+import hashlib
 import hmac
 import json
 import logging
@@ -85,6 +87,7 @@ OUTBOX = os.path.join(os.path.dirname(os.path.abspath(__file__)), "outbox")
 INBOX = os.path.join(os.path.dirname(os.path.abspath(__file__)), "inbox")
 PENDING_DIR = os.path.expanduser("~/.cache/wx-send/pending")   # 待处理消息缓存：unread 读到的，回复或 ack 后才清
 PEEK_DIR = os.path.expanduser("~/.cache/wx-send/peek")   # peek 的状态：新通知从哪算起、角标基线、上次超时提醒
+SENT_DIR = os.path.expanduser("~/.cache/wx-send/sent")   # 最近发过什么（只存哈希），挡住断连后的重发
 CD_EPOCH = 978307200   # 通知数据库的时间从 2001-01-01 UTC 起算
 RECALL = re.compile(r'^(["“].+["”]|对方) ?撤回了一条消息$')   # 对方的撤回提示；自己的「你撤回了一条消息」不算
 MENTION = re.compile(r"^(.+?)在群聊中@了(你|所有人)$", re.S)   # 群里被 @ 时通知只有这句，看不到内容
@@ -288,6 +291,25 @@ def text_arg(p, k):
     return v
 
 
+def dup_minutes() -> int:
+    v = os.environ.get("WX_DUP_MIN", "10")
+    if not v.isdigit():
+        raise ValueError(f"WX_DUP_MIN 必须是非负整数：{v!r}")
+    return int(v)
+
+
+def sent_path(account) -> str:
+    return os.path.join(SENT_DIR, os.path.basename(pending_path(account)))
+
+
+def load_sent(account) -> dict:
+    try:
+        with open(sent_path(account), encoding="utf-8") as f:
+            return json.load(f)
+    except FileNotFoundError:
+        return {}
+
+
 def a_wechat_send(p):
     to = text_arg(p, "to")
     if bool(p.get("text")) == bool(p.get("image")):
@@ -299,12 +321,29 @@ def a_wechat_send(p):
         args = ["--image", to, path]
     else:
         args = [to, text_arg(p, "text")]
-    env = {"WX_DRY_RUN": "1"} if p.get("dry_run") else {}
+    dry = bool(p.get("dry_run"))
+    # 同一个人、同样的内容，几分钟内再发多半是断连后的重试：拦下来，除非 force
+    minutes, now = dup_minutes(), time.time()
+    what = [to, "image", p["image"]] if p.get("image") else [to, "text", p["text"]]
+    key = hashlib.sha256(json.dumps(what, ensure_ascii=False).encode()).hexdigest()
+    sent = {k: v for k, v in load_sent(p.get("account")).items() if v[0] > now - minutes * 60}
+    if key in sent and not dry and not p.get("force"):
+        t, last = sent[key]
+        return {"ok": False, "status": "duplicate_recent", "last_status": last, "acked": 0, "dry_run": False,
+                "output": f"{time.strftime('%H:%M:%S', time.localtime(t))} 已经给「{to}」发过同样的内容（结果：{last}），"
+                          f"这次没发。确认对方没收到、真要再发一遍，加 force"}
+    env = {"WX_DRY_RUN": "1"} if dry else {}
     # 只清发送前已经交给 Muse（wechat-pending 返回过）的待处理消息
     ids = [m["id"] for m in load_pending(p.get("account"))["chats"].get(to, {}).get("messages", []) if m.get("shown")]
     code, out, err = run_wx(args, p.get("account"), env)
     result = {"ok": code == 0, "code": code, "status": WX_STATUS.get(code, "error"), "acked": 0,
-              "dry_run": bool(p.get("dry_run")), "output": "\n".join(x for x in (out, err) if x)}
+              "dry_run": dry, "output": "\n".join(x for x in (out, err) if x)}
+    if code in (0, 10) and not dry and minutes:   # 没确认的也可能已经发出去了
+        try:
+            sent[key] = [now, result["status"]]
+            write_json(sent_path(p.get("account")), sent)
+        except OSError as e:
+            result["dup_error"] = f"防重发记录没写进去：{e}"
     if code == 0 and not p.get("dry_run") and ids:
         # 消息已经发出去了：清缓存出错也不能报失败，否则 Muse 会重发
         try:
@@ -862,6 +901,7 @@ def setup_log():
 class Handler(BaseHTTPRequestHandler):
     server_version = f"muse-intel-mac-bridge/{__version__}"
     started, what = 0.0, ""   # 请求开始时间、日志里记的参数（不含消息内容和图片）
+    rid = ""                  # mab 带来的请求编号：断连时拿它对日志，看 bridge 到底执行了没有
     quiet = False             # peek 每分钟一次，只在要唤醒或出错时记日志
 
     def _authed(self):
@@ -888,12 +928,13 @@ class Handler(BaseHTTPRequestHandler):
             self.close_connection = True
         if self.quiet and code == 200:
             return
-        log.info("%s\t%s\t%s\t%.1fs\t%d 字节\t%s\t%s", self.command, urlparse(self.path).path, code,
-                 time.time() - self.started, len(body), self.what, note.replace("\n", " ⏎ "))
+        log.info("%s\t%s\t%s\t%.1fs\t%d 字节\t%s\t%s\t%s", self.command, urlparse(self.path).path, code,
+                 time.time() - self.started, len(body), self.what, note.replace("\n", " ⏎ "), self.rid)
 
     def do_GET(self):
         self.started = time.time()
         self.quiet = False   # 现在是 HTTP/1.0，一个连接一个请求；以后改成长连接时不会串
+        self.rid = re.sub(r"[^0-9A-Za-z]", "", self.headers.get("X-Request-Id", ""))[:32]
         if not self._authed():
             return self._send(401, {"error": "unauthorized"})
         path = urlparse(self.path).path
@@ -934,6 +975,7 @@ class Handler(BaseHTTPRequestHandler):
     def do_POST(self):
         self.started = time.time()
         self.quiet = False   # 现在是 HTTP/1.0，一个连接一个请求；以后改成长连接时不会串
+        self.rid = re.sub(r"[^0-9A-Za-z]", "", self.headers.get("X-Request-Id", ""))[:32]
         if not self._authed():
             return self._send(401, {"error": "unauthorized"})
         action = ACTIONS.get(urlparse(self.path).path.strip("/"))
